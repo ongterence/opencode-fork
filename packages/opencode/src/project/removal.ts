@@ -1,0 +1,319 @@
+import { eq, inArray } from "drizzle-orm"
+import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
+import { Database } from "@opencode-ai/core/database/database"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { serviceUse } from "@opencode-ai/core/effect/service-use"
+import { Global } from "@opencode-ai/core/global"
+import { AppProcess } from "@opencode-ai/core/process"
+import { ProjectV2 } from "@opencode-ai/core/project"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
+import { SessionShareTable } from "@opencode-ai/core/share/sql"
+import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { Context, Effect, Layer, Schema } from "effect"
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
+import * as Stream from "effect/Stream"
+import path from "path"
+import { GlobalBus } from "@/bus/global"
+import { Workspace } from "@/control-plane/workspace"
+import { InstanceRef } from "@/effect/instance-ref"
+import { EventV2Bridge } from "@/event-v2-bridge"
+import { Session } from "@/session/session"
+import { SessionID } from "@/session/schema"
+import { ShareNext } from "@/share/share-next"
+import { type InstanceContext } from "./instance-context"
+import { InstanceStore } from "./instance-store"
+import * as Project from "./project"
+
+export class NotRemovableError extends Schema.TaggedErrorClass<NotRemovableError>()("Project.NotRemovableError", {
+  projectID: ProjectV2.ID,
+}) {}
+
+export interface Interface {
+  readonly remove: (projectID: ProjectV2.ID) => Effect.Effect<void, Project.NotFoundError | NotRemovableError>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/ProjectRemoval") {}
+
+type GitResult = { code: number; text: string; stderr: string }
+
+const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+    const instanceStore = yield* InstanceStore.Service
+    const shareNext = yield* ShareNext.Service
+    const events = yield* EventV2Bridge.Service
+    const session = yield* Session.Service
+    const workspace = yield* Workspace.Service
+
+    const git = Effect.fnUntraced(
+      function* (args: string[], cwd: string) {
+        const handle = yield* spawner.spawn(ChildProcess.make("git", args, { cwd, extendEnv: true, stdin: "ignore" }))
+        const [text, stderr] = yield* Effect.all(
+          [Stream.mkString(Stream.decodeText(handle.stdout)), Stream.mkString(Stream.decodeText(handle.stderr))],
+          { concurrency: 2 },
+        )
+        return { code: yield* handle.exitCode, text, stderr } satisfies GitResult
+      },
+      Effect.scoped,
+      Effect.catch(() => Effect.succeed({ code: 1, text: "", stderr: "" } satisfies GitResult)),
+    )
+
+    // Mirrors Worktree.cleanDirectory: Windows file locks require many retries.
+    const rmPath = (target: string) =>
+      Effect.tryPromise({
+        try: async () => {
+          const fsp = await import("fs/promises")
+          const attempts = process.platform === "win32" ? 50 : 5
+          for (const attempt of Array.from({ length: attempts }, (_, i) => i)) {
+            try {
+              await fsp.rm(target, { recursive: true, force: true })
+              return
+            } catch {
+              if (attempt === attempts - 1) throw new Error(`failed to remove ${target}`)
+              await new Promise((resolve) => setTimeout(resolve, 100))
+            }
+          }
+        },
+        catch: (cause) => cause,
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("artifact removal failed during project delete", { target, cause }),
+        ),
+      )
+
+    function parseWorktreeList(text: string) {
+      const entries: { path?: string; branch?: string }[] = []
+      for (const line of text.split("\n")) {
+        if (line.startsWith("worktree ")) entries.push({ path: line.slice("worktree ".length) })
+        else if (line.startsWith("branch ") && entries.length > 0)
+          entries[entries.length - 1].branch = line.slice("branch ".length)
+      }
+      return entries
+    }
+
+    // Opencode-created sandbox worktrees register admin entries inside the user's
+    // repo (.git/worktrees). Plain fs deletion would leave dangling entries, so each
+    // entry goes through git first.
+    const removeGitWorktrees = Effect.fn("ProjectRemoval.removeGitWorktrees")(function* (info: Project.Info) {
+      const root = path.join(Global.Path.data, "worktree", info.id)
+      const listed = yield* git(["worktree", "list", "--porcelain"], info.worktree)
+      const owned =
+        listed.code !== 0
+          ? []
+          : parseWorktreeList(listed.text).flatMap((entry) =>
+              entry.path && entry.path.toLowerCase().startsWith(root.toLowerCase())
+                ? [{ path: entry.path, branch: entry.branch?.replace(/^refs\/heads\//, "") }]
+                : [],
+            )
+      if (owned.length === 0) {
+        yield* rmPath(root)
+        return
+      }
+      for (const entry of owned) {
+        yield* instanceStore.disposeDirectory(entry.path).pipe(Effect.ignore)
+        const removed = yield* git(["worktree", "remove", "--force", entry.path], info.worktree)
+        if (removed.code !== 0)
+          yield* Effect.logWarning("git worktree remove failed during project delete", { path: entry.path })
+        yield* rmPath(entry.path)
+        if (entry.branch) {
+          const deleted = yield* git(["branch", "-D", entry.branch], info.worktree)
+          if (deleted.code !== 0)
+            yield* Effect.logWarning("worktree branch delete failed during project delete", { branch: entry.branch })
+        }
+      }
+      // Prune stale admin entries for dirs already gone from disk.
+      yield* git(["worktree", "prune"], info.worktree).pipe(Effect.ignore)
+      yield* rmPath(root)
+    })
+
+    const emitDeleted = (id: string) =>
+      Effect.sync(() =>
+        GlobalBus.emit("event", {
+          directory: "global",
+          payload: { type: Project.Event.Deleted.type, properties: { id } },
+        }),
+      )
+
+    const purgeScoped = Effect.fn("ProjectRemoval.purgeScoped")(function* (
+      projectID: ProjectV2.ID,
+      info: Project.Info,
+      ctx: InstanceContext,
+    ) {
+      // Collect everything owned by the project before any deletion.
+      const sessions = yield* db
+        .select({ id: SessionTable.id, parentID: SessionTable.parent_id })
+        .from(SessionTable)
+        .where(eq(SessionTable.project_id, projectID))
+        .all()
+        .pipe(Effect.orDie)
+      const sessionIDs = new Set(sessions.map((entry) => entry.id))
+      const ids = [...sessionIDs]
+
+      const legacyIDs =
+        ids.length === 0
+          ? { messages: [] as string[], parts: [] as string[] }
+          : {
+              messages: (
+                yield* db
+                  .select({ id: MessageTable.id })
+                  .from(MessageTable)
+                  .where(inArray(MessageTable.session_id, ids))
+                  .all()
+                  .pipe(Effect.orDie)
+              ).map((entry) => entry.id),
+              parts: (
+                yield* db
+                  .select({ id: PartTable.id })
+                  .from(PartTable)
+                  .where(inArray(PartTable.session_id, ids))
+                  .all()
+                  .pipe(Effect.orDie)
+              ).map((entry) => entry.id),
+            }
+
+      const directories = [
+        ...new Set([
+          info.worktree,
+          ...info.sandboxes,
+          ...(
+            yield* db
+              .select({ directory: ProjectDirectoryTable.directory })
+              .from(ProjectDirectoryTable)
+              .where(eq(ProjectDirectoryTable.project_id, projectID))
+              .all()
+              .pipe(Effect.orDie)
+          ).map((entry) => entry.directory),
+        ]),
+      ]
+
+      const shareIDs =
+        ids.length === 0
+          ? []
+          : (
+              yield* db
+                .select({ session_id: SessionShareTable.session_id })
+                .from(SessionShareTable)
+                .where(inArray(SessionShareTable.session_id, ids))
+                .all()
+                .pipe(Effect.orDie)
+            ).map((entry) => SessionID.make(entry.session_id))
+
+      const workspaceIDs = (
+        yield* db.select({ id: WorkspaceTable.id }).from(WorkspaceTable).where(eq(WorkspaceTable.project_id, projectID)).all().pipe(Effect.orDie)
+      ).map((entry) => entry.id)
+
+      // 1. Remote shares must die while state is intact; local rows would cascade
+      // away leaving shares publicly reachable on opencode.ai.
+      yield* Effect.forEach(
+        shareIDs,
+        (id) =>
+          shareNext.remove(id).pipe(
+            Effect.provideService(InstanceRef, ctx),
+            Effect.catchCause((cause) => Effect.logWarning("share removal failed during project delete", { projectID, cause })),
+          ),
+        { discard: true },
+      )
+
+      // 2. Workspaces stop sync fibers, dispose adapters, remove their sessions.
+      yield* Effect.forEach(
+        workspaceIDs,
+        (id) =>
+          workspace.remove(id).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("workspace removal failed during project delete", { projectID, workspaceID: id, cause }),
+            ),
+          ),
+        { discard: true },
+      )
+
+      // 3. Sessions not covered by a workspace: top-most within the project set;
+      // Session.remove recurses children and cleans event rows.
+      const remaining = yield* db
+        .select({ id: SessionTable.id, parentID: SessionTable.parent_id })
+        .from(SessionTable)
+        .where(eq(SessionTable.project_id, projectID))
+        .all()
+        .pipe(Effect.orDie)
+      const remainingIDs = new Set(remaining.map((entry) => entry.id))
+      yield* Effect.forEach(
+        remaining.filter((entry) => !entry.parentID || !remainingIDs.has(entry.parentID)),
+        (entry) =>
+          session.remove(entry.id).pipe(
+            Effect.catchCause((cause) => Effect.logWarning("session removal failed during project delete", { projectID, cause })),
+          ),
+        { discard: true },
+      )
+
+      // 4. FK cascades sweep project_directory, permission, workspace, stragglers.
+      yield* db.delete(ProjectTable).where(eq(ProjectTable.id, projectID)).run().pipe(Effect.orDie)
+
+      // 5. Event aggregates have no FK; no-op where Session.remove already cleaned.
+      yield* Effect.forEach(ids, (id) => events.remove(id).pipe(Effect.ignore), { discard: true })
+
+      // 6. Cached instances for every directory of the project.
+      yield* Effect.forEach(directories, (directory) => instanceStore.disposeDirectory(directory).pipe(Effect.ignore), {
+        discard: true,
+      })
+
+      // 7. Artifacts under Global.Path.data only; never inside info.worktree.
+      yield* removeGitWorktrees(info)
+      yield* rmPath(path.join(Global.Path.data, "snapshot", info.id))
+      yield* rmPath(path.join(Global.Path.data, "storage", "project", `${info.id}.json`))
+      yield* rmPath(path.join(Global.Path.data, "storage", "session", info.id))
+      yield* Effect.forEach(ids, (sid) => rmPath(path.join(Global.Path.data, "storage", "session_diff", `${sid}.json`)), {
+        discard: true,
+      })
+      yield* Effect.forEach(legacyIDs.messages, (mid) => rmPath(path.join(Global.Path.data, "storage", "message", mid)), {
+        discard: true,
+      })
+      yield* Effect.forEach(legacyIDs.parts, (pid) => rmPath(path.join(Global.Path.data, "storage", "part", pid)), {
+        discard: true,
+      })
+
+      // 8. Published LAST so clients react to completed state.
+      yield* emitDeleted(info.id)
+    })
+
+    const purge = Effect.fn("ProjectRemoval.purge")(function* (projectID: ProjectV2.ID) {
+      const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
+      if (!row) return yield* new Project.NotFoundError({ projectID })
+      const info = Project.fromRow(row)
+
+      // Boot or reuse an instance for the root BEFORE tombstoning so share removal
+      // runs with instance context while everything still exists.
+      const ctx = yield* instanceStore.load({ directory: info.worktree })
+
+      const release = Project.markProjectDeleting(projectID)
+      return yield* purgeScoped(projectID, info, ctx).pipe(Effect.ensuring(Effect.sync(release)))
+    })
+
+    const remove = Effect.fn("ProjectRemoval.remove")(function* (projectID: ProjectV2.ID) {
+      if (projectID === ProjectV2.ID.global) return yield* new NotRemovableError({ projectID })
+      yield* purge(projectID)
+    })
+
+    return Service.of({ remove })
+  }),
+)
+
+export const use = serviceUse(Service)
+
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [
+    Database.node,
+    AppProcess.node,
+    CrossSpawnSpawner.node,
+    InstanceStore.node,
+    ShareNext.node,
+    EventV2Bridge.node,
+    Session.node,
+    Workspace.node,
+  ],
+})
+
+export * as ProjectRemoval from "./removal"

@@ -28,6 +28,7 @@ export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
 
 export const Event = {
   Updated: Project.Event.Updated,
+  Deleted: Project.Event.Deleted,
 }
 
 type Row = typeof ProjectTable.$inferSelect
@@ -269,6 +270,9 @@ const layer = Layer.effect(
         { concurrency: "unbounded" },
       ).pipe(Effect.map((arr) => arr.filter((x): x is string => x !== undefined)))
 
+      // Re-check after async resolution: a purge may have tombstoned the project
+      // between the first check and this upsert.
+      if (isProjectDeleting(projectID)) return yield* new NotFoundError({ projectID }).pipe(Effect.orDie)
       yield* db
         .insert(ProjectTable)
         .values({
