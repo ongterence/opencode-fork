@@ -79,6 +79,7 @@ export type Event =
   | EventMcpBrowserOpenFailed
   | EventCommandExecuted
   | EventProjectUpdated
+  | EventProjectDeleted
   | EventSessionStatus
   | EventSessionIdle
   | EventQuestionAsked
@@ -1492,6 +1493,13 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "project.deleted"
+        properties: {
+          id: string
+        }
+      }
+    | {
+        id: string
         type: "session.status"
         properties: {
           sessionID: string
@@ -2029,6 +2037,18 @@ export type Config = {
   }
 }
 
+export type ProjectNotFoundError = {
+  _tag: "ProjectNotFoundError"
+  projectID: string
+  message: string
+}
+
+export type ProjectNotRemovableError = {
+  _tag: "ProjectNotRemovableError"
+  projectID: string
+  message: string
+}
+
 export type Model = {
   id: string
   providerID: string
@@ -2430,12 +2450,6 @@ export type Project = {
   commands?: ProjectCommands
   time: ProjectTime
   sandboxes: Array<string>
-}
-
-export type ProjectNotFoundError = {
-  _tag: "ProjectNotFoundError"
-  projectID: string
-  message: string
 }
 
 export type PtyNotFoundError = {
@@ -2927,6 +2941,7 @@ export type V2Event =
   | McpBrowserOpenFailed
   | CommandExecuted
   | ProjectUpdated
+  | ProjectDeleted
   | SessionStatus2
   | SessionIdle
   | QuestionAsked
@@ -5910,6 +5925,23 @@ export type ProjectUpdated = {
   }
 }
 
+export type ProjectDeleted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "project.deleted"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    id: string
+  }
+}
+
 export type SessionIdle = {
   id: string
   metadata?: {
@@ -6928,6 +6960,14 @@ export type EventProjectUpdated = {
   }
 }
 
+export type EventProjectDeleted = {
+  id: string
+  type: "project.deleted"
+  properties: {
+    id: string
+  }
+}
+
 export type EventSessionStatus = {
   id: string
   type: "session.status"
@@ -7385,6 +7425,37 @@ export type GlobalUpgradeResponses = {
 }
 
 export type GlobalUpgradeResponse = GlobalUpgradeResponses[keyof GlobalUpgradeResponses]
+
+export type GlobalProjectDeleteData = {
+  body?: never
+  path: {
+    projectID: string
+  }
+  query?: never
+  url: "/global/project/{projectID}"
+}
+
+export type GlobalProjectDeleteErrors = {
+  /**
+   * ProjectNotRemovableError | InvalidRequestError
+   */
+  400: ProjectNotRemovableError | InvalidRequestError
+  /**
+   * ProjectNotFoundError
+   */
+  404: ProjectNotFoundError
+}
+
+export type GlobalProjectDeleteError = GlobalProjectDeleteErrors[keyof GlobalProjectDeleteErrors]
+
+export type GlobalProjectDeleteResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type GlobalProjectDeleteResponse = GlobalProjectDeleteResponses[keyof GlobalProjectDeleteResponses]
 
 export type EventSubscribeData = {
   body?: never
