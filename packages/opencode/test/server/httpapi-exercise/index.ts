@@ -115,6 +115,15 @@ const scenarios: Scenario[] = [
       },
       "status",
     ),
+  // Seeding needs an instance-backed throwaway project, but the route itself is global and takes no directory header.
+  http.protected
+    .delete("/global/project/{projectID}", "global.project.delete")
+    .mutating()
+    .seeded((ctx) => ctx.project())
+    .at((ctx) => ({
+      path: route("/global/project/{projectID}", { projectID: ctx.state.id }),
+    }))
+    .status(204, undefined, "status"),
   http.protected.get("/path", "path.get").json(200, (body, ctx) => {
     object(body)
     check(body.directory === ctx.directory, "directory should resolve from x-opencode-directory")
