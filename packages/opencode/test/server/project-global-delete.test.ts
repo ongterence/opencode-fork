@@ -72,6 +72,9 @@ describe("global project delete endpoint", () => {
         const del = yield* request(`/global/project/${target.id}`, { method: "DELETE" })
         expect(del.status).toBe(204)
 
+        const repeat = yield* request(`/global/project/${target!.id}`, { method: "DELETE" })
+        expect(repeat.status).toBe(404)
+
         // Assert on the database directly: a follow-up directory-scoped request would
         // boot a fresh instance and legitimately re-register the project.
         const { db } = yield* Database.Service

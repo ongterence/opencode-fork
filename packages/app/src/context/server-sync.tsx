@@ -535,10 +535,12 @@ export function createServerSyncContextInner(
   // trigger bootstrap-failure toasts on each SSE reconnect.
   const forgetProject = (directory: string) => {
     const key = directoryKey(directory)
+    queue.clear(key)
     sdkCache.delete(key)
     booting.delete(key)
     sessionLoads.delete(key)
     sessionMeta.delete(key)
+    clearProviderRev(serverSDK.scope, key)
     children.disposeDirectory(key)
   }
 
