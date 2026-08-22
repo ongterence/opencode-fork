@@ -10,7 +10,8 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Schedule, Schema } from "effect"
+import { existsSync } from "fs"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import * as Stream from "effect/Stream"
 import path from "path"
@@ -94,17 +95,27 @@ const layer = Layer.effect(
       return entries
     }
 
+    // Mirrors Worktree.remove: fsmonitor daemons hold directory handles on Windows
+    // and must be stopped before the worktree directory can be removed.
+    const stopFsmonitor = Effect.fnUntraced(function* (target: string) {
+      if (!existsSync(target)) return
+      yield* git(["fsmonitor--daemon", "stop"], target)
+    })
+
     // Opencode-created sandbox worktrees register admin entries inside the user's
     // repo (.git/worktrees). Plain fs deletion would leave dangling entries, so each
     // entry goes through git first.
     const removeGitWorktrees = Effect.fn("ProjectRemoval.removeGitWorktrees")(function* (info: Project.Info) {
-      const root = path.join(Global.Path.data, "worktree", info.id)
+      // `git worktree list` emits forward-slash paths even on Windows, where
+      // path.join produces backslash separators.
+      const normalize = (value: string) => value.toLowerCase().replaceAll("\\", "/")
+      const root = normalize(path.join(Global.Path.data, "worktree", info.id))
       const listed = yield* git(["worktree", "list", "--porcelain"], info.worktree)
       const owned =
         listed.code !== 0
           ? []
           : parseWorktreeList(listed.text).flatMap((entry) =>
-              entry.path && entry.path.toLowerCase().startsWith(root.toLowerCase())
+              entry.path && normalize(entry.path).startsWith(root)
                 ? [{ path: entry.path, branch: entry.branch?.replace(/^refs\/heads\//, "") }]
                 : [],
             )
@@ -114,18 +125,29 @@ const layer = Layer.effect(
       }
       for (const entry of owned) {
         yield* instanceStore.disposeDirectory(entry.path).pipe(Effect.ignore)
+        yield* stopFsmonitor(entry.path)
         const removed = yield* git(["worktree", "remove", "--force", entry.path], info.worktree)
         if (removed.code !== 0)
           yield* Effect.logWarning("git worktree remove failed during project delete", { path: entry.path })
         yield* rmPath(entry.path)
-        if (entry.branch) {
-          const deleted = yield* git(["branch", "-D", entry.branch], info.worktree)
-          if (deleted.code !== 0)
-            yield* Effect.logWarning("worktree branch delete failed during project delete", { branch: entry.branch })
-        }
       }
       // Prune stale admin entries for dirs already gone from disk.
       yield* git(["worktree", "prune"], info.worktree).pipe(Effect.ignore)
+
+      // Branch refs are only safe to destroy once git confirms their worktree is
+      // gone; failed removals keep both the admin entry and the branch.
+      const after = yield* git(["worktree", "list", "--porcelain"], info.worktree)
+      const remaining = new Set(
+        after.code !== 0
+          ? []
+          : parseWorktreeList(after.text).flatMap((entry) => (entry.path ? [normalize(entry.path)] : [])),
+      )
+      for (const entry of owned) {
+        if (!entry.branch || remaining.has(normalize(entry.path))) continue
+        const deleted = yield* git(["branch", "-D", entry.branch], info.worktree)
+        if (deleted.code !== 0)
+          yield* Effect.logWarning("worktree branch delete failed during project delete", { branch: entry.branch })
+      }
       yield* rmPath(root)
     })
 
@@ -133,6 +155,7 @@ const layer = Layer.effect(
       Effect.sync(() =>
         GlobalBus.emit("event", {
           directory: "global",
+          project: id,
           payload: { type: Project.Event.Deleted.type, properties: { id } },
         }),
       )
@@ -206,13 +229,17 @@ const layer = Layer.effect(
       ).map((entry) => entry.id)
 
       // 1. Remote shares must die while state is intact; local rows would cascade
-      // away leaving shares publicly reachable on opencode.ai.
+      // away leaving shares publicly reachable on opencode.ai. Retries absorb
+      // transient network failures so a public share is not orphaned permanently.
       yield* Effect.forEach(
         shareIDs,
         (id) =>
           shareNext.remove(id).pipe(
             Effect.provideService(InstanceRef, ctx),
-            Effect.catchCause((cause) => Effect.logWarning("share removal failed during project delete", { projectID, cause })),
+            Effect.retry({ times: 2, schedule: Schedule.spaced("200 millis") }),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("share removal failed during project delete", { projectID, cause }),
+            ),
           ),
         { discard: true },
       )
@@ -278,6 +305,8 @@ const layer = Layer.effect(
     })
 
     const purge = Effect.fn("ProjectRemoval.purge")(function* (projectID: ProjectV2.ID) {
+      // Idempotent re-entry guard: a concurrent purge has already tombstoned the project.
+      if (Project.isProjectDeleting(projectID)) return yield* Effect.void
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       if (!row) return yield* new Project.NotFoundError({ projectID })
       const info = Project.fromRow(row)

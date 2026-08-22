@@ -87,7 +87,7 @@ export function markProjectDeleting(id: string) {
   return () => deleting.delete(id)
 }
 
-function isProjectDeleting(id: string) {
+export function isProjectDeleting(id: string) {
   return deleting.has(id)
 }
 
