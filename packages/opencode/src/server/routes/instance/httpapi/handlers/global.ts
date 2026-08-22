@@ -11,7 +11,9 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
+import { ProjectNotFoundError, ProjectNotRemovableError } from "../errors"
 import { GlobalUpgradeInput } from "../groups/global"
+import { ProjectRemoval } from "@/project/removal"
 
 function eventData(data: unknown): Sse.Event {
   return {
@@ -70,6 +72,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const config = yield* Config.Service
     const installation = yield* Installation.Service
     const bridge = yield* EffectBridge.make()
+    const removal = yield* ProjectRemoval.Service
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
       return { healthy: true as const, version: InstallationVersion }
@@ -92,6 +95,19 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const dispose = Effect.fn("GlobalHttpApi.dispose")(function* () {
       yield* disposeAllInstancesAndEmitGlobalDisposed()
       return true
+    })
+
+    const projectDelete = Effect.fn("GlobalHttpApi.projectDelete")(function* (ctx) {
+      yield* removal.remove(ctx.params.projectID).pipe(
+        Effect.catchTag("Project.NotFoundError", () =>
+          Effect.fail(new ProjectNotFoundError({ projectID: ctx.params.projectID, message: "Project not found" })),
+        ),
+        Effect.catchTag("Project.NotRemovableError", () =>
+          Effect.fail(
+            new ProjectNotRemovableError({ projectID: ctx.params.projectID, message: "This project cannot be deleted" }),
+          ),
+        ),
+      )
     })
 
     const upgrade = Effect.fn("GlobalHttpApi.upgrade")(function* (ctx: { payload: typeof GlobalUpgradeInput.Type }) {
@@ -151,6 +167,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)
       .handle("dispose", dispose)
+      .handle("projectDelete", projectDelete)
       .handleRaw("upgrade", upgradeRaw)
   }),
 )

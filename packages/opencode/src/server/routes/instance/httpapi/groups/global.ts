@@ -1,11 +1,13 @@
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { EventV2 } from "@opencode-ai/core/event"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { EventManifest } from "@/event-manifest"
 import { InstanceDisposed } from "@/server/event"
 import "@opencode-ai/core/account"
 import "@/server/event"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
+import { ProjectNotFoundError, ProjectNotRemovableError } from "../errors"
 import { described } from "./metadata"
 
 const GlobalHealth = Schema.Struct({
@@ -68,6 +70,7 @@ export const GlobalPaths = {
   config: "/global/config",
   dispose: "/global/dispose",
   upgrade: "/global/upgrade",
+  projectDelete: "/global/project/:projectID",
 } as const
 
 export const GlobalApi = HttpApi.make("global").add(
@@ -129,6 +132,18 @@ export const GlobalApi = HttpApi.make("global").add(
           identifier: "global.upgrade",
           summary: "Upgrade opencode",
           description: "Upgrade opencode to the specified version or latest if not specified.",
+        }),
+      ),
+      HttpApiEndpoint.delete("projectDelete", GlobalPaths.projectDelete, {
+        params: { projectID: ProjectV2.ID },
+        success: HttpApiSchema.NoContent,
+        error: [ProjectNotFoundError, ProjectNotRemovableError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.project.delete",
+          summary: "Delete a project",
+          description:
+            "Permanently remove all OpenCode-owned data for a project: sessions, history, workspaces, permissions and caches under the OpenCode data directory. Never deletes files inside the project directory.",
         }),
       ),
     )
