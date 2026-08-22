@@ -41,4 +41,5 @@ export const Info = Schema.Struct({
 export interface Info extends Schema.Schema.Type<typeof Info> {}
 
 const Updated = define({ type: "project.updated", schema: Info.fields })
-export const Event = { Updated, Definitions: inventory(Updated) }
+const Deleted = define({ type: "project.deleted", schema: { id: ID } })
+export const Event = { Updated, Deleted, Definitions: inventory(Updated, Deleted) }
