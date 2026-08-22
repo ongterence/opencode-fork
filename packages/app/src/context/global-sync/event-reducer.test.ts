@@ -105,6 +105,34 @@ describe("applyGlobalEvent", () => {
     expect(refreshCount).toBe(0)
   })
 
+  test("project.deleted splices the catalog entry", () => {
+    const project = [{ id: "p1" }, { id: "p2" }] as Project[]
+    applyGlobalEvent({
+      event: { type: "project.deleted", properties: { id: "p1" } },
+      project,
+      refresh: () => {},
+      setGlobalProject(next) {
+        if (typeof next === "function") next(project)
+      },
+    })
+
+    expect(project.map((x) => x.id)).toEqual(["p2"])
+  })
+
+  test("project.deleted ignores unknown ids", () => {
+    const project = [{ id: "p2" }] as Project[]
+    applyGlobalEvent({
+      event: { type: "project.deleted", properties: { id: "nope" } },
+      project,
+      refresh: () => {},
+      setGlobalProject(next) {
+        if (typeof next === "function") next(project)
+      },
+    })
+
+    expect(project.map((x) => x.id)).toEqual(["p2"])
+  })
+
   test("handles global.disposed by triggering refresh", () => {
     let refreshCount = 0
     applyGlobalEvent({

@@ -108,7 +108,14 @@ function createServerCtx(
     },
   })
   const sdk = createServerSdkContext(conn, scope)
-  const sync = createServerSyncContext(sdk)
+  const sync = createServerSyncContext(sdk, {
+    onProjectDeleted: (worktree) => {
+      if (!worktree) return
+      // remove(), not close(): deletion must never land under Recently closed.
+      projects.remove(worktree)
+      sync.forgetProject(worktree)
+    },
+  })
 
   function enrich(project: { worktree: string; expanded: boolean }) {
     const [childStore] = sync.child(project.worktree, { bootstrap: false })

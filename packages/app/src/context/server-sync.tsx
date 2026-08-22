@@ -202,7 +202,10 @@ function makeQueryOptionsApi(
 }
 export type QueryOptionsApi = ReturnType<typeof makeQueryOptionsApi>
 
-export function createServerSyncContextInner(serverSDK: ServerSDK) {
+export function createServerSyncContextInner(
+  serverSDK: ServerSDK,
+  options?: { onProjectDeleted?: (worktree?: string) => void },
+) {
   const language = useLanguage()
   const owner = getOwner()
   if (!owner) throw new Error("ServerSync must be created within owner")
@@ -528,6 +531,17 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     })
   }
 
+  // Drops every client-side cache bound to a directory so a deleted project cannot
+  // trigger bootstrap-failure toasts on each SSE reconnect.
+  const forgetProject = (directory: string) => {
+    const key = directoryKey(directory)
+    sdkCache.delete(key)
+    booting.delete(key)
+    sessionLoads.delete(key)
+    sessionMeta.delete(key)
+    children.disposeDirectory(key)
+  }
+
   const unsub = serverSDK.event.listen((e) => {
     const directory = e.name
     const key = directoryKey(directory)
@@ -544,6 +558,11 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     if (eventType === "integration.connection.updated") void refreshProviders()
 
     if (directory === "global") {
+      if (eventType === "project.deleted") {
+        const id = (event.properties as { id?: string }).id
+        const entry = globalStore.project.find((candidate) => candidate.id === id)
+        options?.onProjectDeleted?.(entry?.worktree)
+      }
       if (eventType === "server.connected" && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
         void activeSessionsQuery.refetch()
       applyGlobalEvent({
@@ -684,6 +703,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     disableMcp: children.disableMcp,
     queryOptions: queryOptionsApi,
     refreshProviders,
+    forgetProject,
     // bootstrap,
     updateConfig: updateConfigMutation.mutateAsync,
     project: projectApi,
@@ -724,8 +744,11 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   }
 }
 
-export function createServerSyncContext(serverSDK: ServerSDK) {
-  const inner = createServerSyncContextInner(serverSDK)
+export function createServerSyncContext(
+  serverSDK: ServerSDK,
+  options?: { onProjectDeleted?: (worktree?: string) => void },
+) {
+  const inner = createServerSyncContextInner(serverSDK, options)
   return Object.assign(inner, {
     ensureDirSyncContext: createRefCountMap(
       (dir) => createDirSyncContext(dir, inner, serverSDK),
