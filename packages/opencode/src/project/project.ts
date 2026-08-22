@@ -76,6 +76,20 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Pro
   projectID: ProjectV2.ID,
 }) {}
 
+// Process-global tombstones for projects currently being removed. fromDirectory
+// checks this set so requests racing a removal cannot resurrect or re-upsert the
+// doomed project row mid-purge.
+const deleting = new Set<string>()
+
+export function markProjectDeleting(id: string) {
+  deleting.add(id)
+  return () => deleting.delete(id)
+}
+
+function isProjectDeleting(id: string) {
+  return deleting.has(id)
+}
+
 // ---------------------------------------------------------------------------
 // Effect service
 // ---------------------------------------------------------------------------
@@ -218,6 +232,7 @@ const layer = Layer.effect(
 
       // Phase 2: upsert
       const projectID = ProjectV2.ID.make(data.id)
+      if (isProjectDeleting(projectID)) return yield* new NotFoundError({ projectID }).pipe(Effect.orDie)
       yield* migrateProjectId(data.previous ? ProjectV2.ID.make(data.previous) : undefined, projectID)
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       const existing = row
