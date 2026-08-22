@@ -104,6 +104,30 @@ export function createHomeProjectsController(home: HomeController) {
         )
         if (next) home.selection.set(next)
       },
+      delete: (conn: ServerConnection.Any, project: LocalProject) => {
+        const projectID = project.id
+        if (!projectID || projectID === "global") return
+        void import("@/components/dialog-delete-project").then(({ DialogDeleteProject }) => {
+          void dialog.show(() => (
+            <DialogDeleteProject
+              name={project.name ?? project.worktree}
+              remove={async () => {
+                const ctx = home.server.context(conn)
+                await ctx.sdk.client.global.project.delete({ projectID })
+              }}
+              onDeleted={() => {
+                const ctx = home.server.context(conn)
+                // remove(), not close(): deletion must never land under Recently closed.
+                ctx.projects.remove(project.worktree)
+                const selection = home.selection.value()
+                if (selection.server === ServerConnection.key(conn) && selection.directory === project.worktree) {
+                  home.selection.set({ server: ServerConnection.key(conn) })
+                }
+              }}
+            />
+          ))
+        })
+      },
       move: (conn: ServerConnection.Any, worktree: string, index: number) => {
         home.server.context(conn).projects.move(worktree, index)
       },

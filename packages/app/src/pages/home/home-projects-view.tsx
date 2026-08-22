@@ -56,6 +56,7 @@ export type HomeProjectsViewProps = {
   onRevealProject: (server: ServerConnection.Any, project: LocalProject) => void
   onClearNotifications: (server: ServerConnection.Any, project: LocalProject) => void
   onCloseProject: (server: ServerConnection.Any, directory: string) => void
+  onDeleteProject: (server: ServerConnection.Any, project: LocalProject) => void
   onOpenSettings: () => void
   onOpenHelp: () => void
 }
@@ -568,6 +569,9 @@ function HomeProjectRow(
               <MenuV2.Separator />
               <MenuV2.Item onSelect={() => props.onCloseProject(props.server, props.project.worktree)}>
                 {props.language.t("common.close")}
+              </MenuV2.Item>
+              <MenuV2.Item onSelect={() => props.onDeleteProject(props.server, props.project)}>
+                {props.language.t("project.delete.title")}
               </MenuV2.Item>
             </MenuV2.Content>
           </MenuV2.Portal>
