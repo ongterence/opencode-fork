@@ -1262,4 +1262,9 @@ export const dict = {
   "error.childStore.persistedProjectIconCreateFailed": "Error al crear icono de proyecto persistente",
   "error.childStore.storeCreateFailed": "Error al crear almacén",
   "terminal.connectionLost.abnormalClose": "WebSocket cerrado anormalmente: {{code}}",
+
+  "project.delete.failed.title": "Failed to delete project",
+  "project.delete.title": "Delete project",
+  "project.delete.confirm": "Delete \"{{name}}\"? All sessions and OpenCode data for this project will be permanently removed.",
+  "project.delete.button": "Delete project",
 }

@@ -1173,4 +1173,9 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} ဆက်ရှင်များကို သိမ်းဆည်းထားပါမည်။",
   "workspace.reset.note": "၎င်းသည် မူရင်းဌာနခွဲနှင့် ကိုက်ညီစေရန် အလုပ်ခွင်ကို ပြန်လည်သတ်မှတ်ပါမည်။",
   "dialog.usageExceeded.dontShowAgain": "ထပ်မပြပါနှင့်",
+
+  "project.delete.failed.title": "Failed to delete project",
+  "project.delete.title": "Delete project",
+  "project.delete.confirm": "Delete \"{{name}}\"? All sessions and OpenCode data for this project will be permanently removed.",
+  "project.delete.button": "Delete project",
 }

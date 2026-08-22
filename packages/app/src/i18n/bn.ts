@@ -1149,4 +1149,9 @@ export const dict: Record<string, string> = {
   "workspace.reset.archived.many": "{{count}} সেশন আর্কাইভ করা হবে।",
   "workspace.reset.note": "এটি ডিফল্ট শাখার সাথে মেলে ওয়ার্কস্পেস রিসেট করবে।",
   "dialog.usageExceeded.dontShowAgain": "আবার দেখাবেন না",
+
+  "project.delete.failed.title": "Failed to delete project",
+  "project.delete.title": "Delete project",
+  "project.delete.confirm": "Delete \"{{name}}\"? All sessions and OpenCode data for this project will be permanently removed.",
+  "project.delete.button": "Delete project",
 }

@@ -1156,4 +1156,9 @@ export const dict = {
   "workspace.reset.archived.many": "{{count}} sessiýalary arhiwlener.",
   "workspace.reset.note": "Bu workspace-i adaty şaha gabat getirmek üçin täzeden düzer.",
   "dialog.usageExceeded.dontShowAgain": "Gaýtadan görkezme",
+
+  "project.delete.failed.title": "Failed to delete project",
+  "project.delete.title": "Delete project",
+  "project.delete.confirm": "Delete \"{{name}}\"? All sessions and OpenCode data for this project will be permanently removed.",
+  "project.delete.button": "Delete project",
 }
