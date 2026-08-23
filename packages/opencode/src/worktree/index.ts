@@ -17,6 +17,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppProcess } from "@opencode-ai/core/process"
 import { InstanceState } from "@/effect/instance-state"
 import { WorktreeEvent } from "@opencode-ai/schema/worktree-event"
+import { deletionTarget } from "@/project/removal-paths"
 
 export const Event = WorktreeEvent
 
@@ -205,7 +206,12 @@ const layer: Layer.Layer<
         return yield* new NotGitError({ message: "Worktrees are only supported for git projects" })
       }
 
-      const root = pathSvc.join(Global.Path.data, "worktree", ctx.project.id)
+      const root = deletionTarget({
+        pathApi: pathSvc,
+        dataRoot: Global.Path.data,
+        category: "worktree",
+        projectID: ctx.project.id,
+      })
       yield* fs.makeDirectory(root, { recursive: true }).pipe(Effect.orDie)
 
       return yield* candidate({ root, name: input?.name ? slugify(input.name) : "", detached: input?.detached })

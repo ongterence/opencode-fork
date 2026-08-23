@@ -10,6 +10,7 @@ import { Hash } from "@opencode-ai/core/util/hash"
 import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
+import { deletionTarget, requireStrictDescendant } from "@/project/removal-paths"
 
 export const Patch = Schema.Struct({
   hash: Schema.String,
@@ -65,10 +66,16 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Snapshot.state")(function* (ctx) {
+        const snapshotRoot = deletionTarget({
+          pathApi: path,
+          dataRoot: Global.Path.data,
+          category: "snapshot",
+          projectID: ctx.project.id,
+        })
         const state = {
           directory: ctx.directory,
           worktree: ctx.worktree,
-          gitdir: path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree)),
+          gitdir: requireStrictDescendant(path, snapshotRoot, path.join(snapshotRoot, Hash.fast(ctx.worktree))),
           vcs: ctx.project.vcs,
         }
 

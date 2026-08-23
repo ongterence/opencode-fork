@@ -19,12 +19,13 @@ import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2 } from "@opencode-ai/core/event"
 import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { Context, Effect, Layer } from "effect"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import path from "path"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
 import { Snapshot } from "../../src/snapshot"
 import { ProjectDeletionCoordinator } from "../../src/project/deletion-coordinator"
+import { deletionTarget, opaqueStorageKey } from "../../src/project/removal-paths"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
@@ -647,8 +648,20 @@ describe("global project delete endpoint", () => {
         const session = (yield* created.json) as { id: SessionID }
         const messageID = MessageID.make("msg_cleanup_snapshot")
         const partID = PartID.make("prt_cleanup_snapshot")
-        const root = path.join(Global.Path.data, "worktree", project.id)
+        const root = deletionTarget({
+          pathApi: path,
+          dataRoot: Global.Path.data,
+          category: "worktree",
+          projectID: project.id,
+        })
         const worktree = path.join(root, "retry-locked")
+        const sibling = path.join(
+          Global.Path.data,
+          "project-artifacts",
+          "v1",
+          `${opaqueStorageKey(project.id)}-personal`,
+          "sibling",
+        )
         const artifact = path.join(Global.Path.data, "storage", "project", `${project.id}.json`)
         const sessionDiffArtifact = path.join(Global.Path.data, "storage", "session_diff", `${session.id}.json`)
         const messageArtifact = path.join(Global.Path.data, "storage", "message", messageID)
@@ -673,7 +686,9 @@ describe("global project delete endpoint", () => {
           .run()
           .pipe(Effect.orDie)
         yield* Effect.promise(() => $`git worktree add -b deletion-retry ${worktree}`.cwd(tmp.directory).quiet())
+        yield* Effect.promise(() => $`git worktree add -b deletion-sibling ${sibling}`.cwd(tmp.directory).quiet())
         yield* Effect.promise(() => $`git worktree lock ${worktree}`.cwd(tmp.directory).quiet())
+        yield* db.run(sql`UPDATE project SET sandboxes = ${JSON.stringify([worktree])} WHERE id = ${project.id}`).pipe(Effect.orDie)
         yield* Effect.forEach(
           [artifact, sessionDiffArtifact, path.join(messageArtifact, "data"), path.join(partArtifact, "data")],
           (target) => Effect.promise(() => Bun.write(target, "must be removed")),
@@ -706,11 +721,12 @@ describe("global project delete endpoint", () => {
         expect(
           (yield* db.select().from(ProjectTable).all().pipe(Effect.orDie)).some((row) => row.id === project.id),
         ).toBe(false)
-        expect(yield* fs.exists(root)).toBe(false)
+        expect(yield* fs.exists(worktree)).toBe(false)
         expect(yield* fs.exists(artifact)).toBe(false)
         expect(yield* fs.exists(sessionDiffArtifact)).toBe(false)
         expect(yield* fs.exists(messageArtifact)).toBe(false)
         expect(yield* fs.exists(partArtifact)).toBe(false)
+        expect(yield* fs.exists(sibling)).toBe(true)
         expect(yield* db.select().from(ProjectDeletionJobTable).all().pipe(Effect.orDie)).toEqual([])
         expect(yield* db.select().from(ProjectDeletionWorktreeTable).all().pipe(Effect.orDie)).toEqual([])
         expect(yield* db.select().from(ProjectDeletionArtifactTable).all().pipe(Effect.orDie)).toEqual([])

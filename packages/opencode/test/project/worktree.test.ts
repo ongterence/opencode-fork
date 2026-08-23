@@ -95,6 +95,20 @@ describe("Worktree", () => {
     )
 
     it.instance(
+      "allocates new worktrees in the opaque v1 namespace",
+      () =>
+        Effect.gen(function* () {
+          const svc = yield* Worktree.Service
+          const info = yield* svc.makeWorktreeInfo({ name: "opaque-target" })
+
+          expect(normalize(info.directory)).toContain("/project-artifacts/v1/")
+          expect(normalize(info.directory)).toContain("/worktree/")
+          expect(normalize(info.directory)).not.toContain("/worktree/proj_")
+        }),
+      { git: true },
+    )
+
+    it.instance(
       "uses provided name as base",
       () =>
         Effect.gen(function* () {

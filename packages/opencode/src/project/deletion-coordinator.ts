@@ -3,6 +3,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Global } from "@opencode-ai/core/global"
 import {
   type DeletionPhase,
   ProjectDeletionArtifactTable,
@@ -16,7 +17,9 @@ import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { and, eq, inArray, sql } from "drizzle-orm"
 import { Cause, Context, Deferred, Duration, Effect, Exit, Layer, Schema } from "effect"
+import path from "path"
 import { NotFoundError, NotRemovableError } from "./project-errors"
+import { ownedWorktreeTarget } from "./removal-paths"
 
 export type DeleteOutcome =
   | { status: "completed" }
@@ -444,6 +447,23 @@ export function make(options: MakeOptions = {}) {
                       .all()
                     const paths = [...project.sandboxes.map((path) => ({ path, branch: null })), ...workspaces]
                       .filter((item): item is { path: string; branch: string | null } => item.path !== null)
+                      .flatMap((item) => {
+                        try {
+                          return [
+                            {
+                              ...item,
+                              path: ownedWorktreeTarget({
+                                pathApi: path,
+                                dataRoot: Global.Path.data,
+                                projectID,
+                                candidate: item.path,
+                              }),
+                            },
+                          ]
+                        } catch {
+                          return []
+                        }
+                      })
                       .filter((item, index, all) => all.findIndex((other) => other.path === item.path) === index)
                     if (paths.length > 0)
                       yield* tx

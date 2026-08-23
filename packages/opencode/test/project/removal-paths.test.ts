@@ -6,6 +6,7 @@ import {
   UnsafeLegacyMetadataError,
   deletionTarget,
   legacyDeletionTarget,
+  ownedWorktreeTarget,
   opaqueStorageKey,
   requireLegacyLeaf,
   requireStrictDescendant,
@@ -75,6 +76,30 @@ describe("project removal paths", () => {
         `C:\\Data\\project-artifacts\\v1\\${opaqueStorageKey(input.projectID)}\\${input.category}\\${opaqueStorageKey(input.relatedID)}`,
       )
     }
+  })
+
+  test("accepts only exact owned worktree descendants with platform-correct casing", () => {
+    const projectID = "../cached-project-id"
+    const posixRoot = `/data/project-artifacts/v1/${opaqueStorageKey(projectID)}/worktree`
+    const winRoot = `C:\\Data\\project-artifacts\\v1\\${opaqueStorageKey(projectID)}\\worktree`
+
+    expect(
+      ownedWorktreeTarget({ pathApi: path.posix, dataRoot: "/data", projectID, candidate: `${posixRoot}/ws_a` }),
+    ).toBe(`${posixRoot}/ws_a`)
+    expect(() =>
+      ownedWorktreeTarget({ pathApi: path.posix, dataRoot: "/data", projectID, candidate: `${posixRoot}-personal/ws_a` }),
+    ).toThrow()
+    expect(() =>
+      ownedWorktreeTarget({ pathApi: path.posix, dataRoot: "/data", projectID, candidate: `${posixRoot.replace("/data", "/Data")}/ws_a` }),
+    ).toThrow()
+    expect(
+      ownedWorktreeTarget({
+        pathApi: path.win32,
+        dataRoot: "C:\\Data",
+        projectID,
+        candidate: winRoot.replace("C:\\Data", "c:\\data") + "\\ws_a",
+      }),
+    ).toBe(winRoot.toLowerCase() + "\\ws_a")
   })
 
   test("maps ordinary legacy identities to the established storage layout", () => {

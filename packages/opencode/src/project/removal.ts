@@ -31,7 +31,7 @@ import { InstanceStore } from "./instance-store"
 import * as Project from "./project"
 import { ProjectDeletingError, ProjectDeletionCoordinator } from "./deletion-coordinator"
 import { NotRemovableError } from "./project-errors"
-import { legacyDeletionTarget } from "./removal-paths"
+import { UnsafeLegacyMetadataError, deletionTarget, legacyDeletionTarget, ownedWorktreeTarget } from "./removal-paths"
 
 export { NotRemovableError } from "./project-errors"
 
@@ -47,6 +47,24 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/ProjectRemoval") {}
 
 type GitResult = { code: number; text: string; stderr: string }
+
+export class RequiredCleanupError extends Error {
+  readonly code: "legacy_artifact_manual_reconciliation" | "required_cleanup_failed"
+
+  constructor(
+    readonly operation: string,
+    readonly identity: string,
+    cause?: unknown,
+  ) {
+    super(
+      cause instanceof UnsafeLegacyMetadataError
+        ? `legacy_artifact_manual_reconciliation: ${operation}:${identity}`
+        : `required_cleanup_failed: ${operation}:${identity}`,
+      { cause },
+    )
+    this.code = cause instanceof UnsafeLegacyMetadataError ? "legacy_artifact_manual_reconciliation" : "required_cleanup_failed"
+  }
+}
 
 const layer = Layer.effect(
   Service,
@@ -93,6 +111,23 @@ const layer = Layer.effect(
         catch: (cause) => cause,
       })
 
+    const required = <A>(operation: string, identity: string, effect: Effect.Effect<A, unknown>) =>
+      effect.pipe(Effect.mapError((cause) => new RequiredCleanupError(operation, identity, cause)))
+
+    const legacyTarget = (
+      category: Parameters<typeof legacyDeletionTarget>[0]["category"],
+      projectID: string | undefined,
+      relatedID: string | undefined,
+    ) =>
+      required(
+        "legacy_artifact",
+        `${category}:${relatedID ?? projectID ?? ""}`,
+        Effect.try({
+          try: () => legacyDeletionTarget({ pathApi: path, dataRoot: Global.Path.data, category, projectID, relatedID }),
+          catch: (cause) => cause,
+        }),
+      )
+
     function parseWorktreeList(text: string) {
       const entries: { path?: string; branch?: string }[] = []
       for (const line of text.split("\n")) {
@@ -113,63 +148,119 @@ const layer = Layer.effect(
     // Opencode-created sandbox worktrees register admin entries inside the user's
     // repo (.git/worktrees). Plain fs deletion would leave dangling entries, so each
     // entry goes through git first.
-    const removeGitWorktrees = Effect.fn("ProjectRemoval.removeGitWorktrees")(function* (info: Project.Info) {
-      // `git worktree list` emits forward-slash paths even on Windows, where
-      // path.join produces backslash separators.
-      const normalize = (value: string) => value.toLowerCase().replaceAll("\\", "/")
-      const root = normalize(path.join(Global.Path.data, "worktree", info.id))
+    const removeGitWorktrees = Effect.fn("ProjectRemoval.removeGitWorktrees")(function* (projectID: ProjectV2.ID, info: Project.Info) {
+      const identity = (value: string) => (process.platform === "win32" ? value.toLowerCase() : value)
       const recorded = yield* db
         .select({ path: ProjectDeletionWorktreeTable.canonical_path, branch: ProjectDeletionWorktreeTable.branch })
         .from(ProjectDeletionWorktreeTable)
         .where(eq(ProjectDeletionWorktreeTable.project_id, info.id))
         .all()
         .pipe(Effect.orDie)
-      const recordedBranches = new Map(recorded.map((entry) => [normalize(entry.path), entry.branch]))
+      const owned = yield* Effect.forEach(
+        recorded,
+        (entry) =>
+          required(
+            "worktree_snapshot",
+            entry.path,
+            Effect.try({
+              try: () => ({
+                canonical_path: ownedWorktreeTarget({
+                  pathApi: path,
+                  dataRoot: Global.Path.data,
+                  projectID,
+                  candidate: entry.path,
+                }),
+                branch: entry.branch,
+              }),
+              catch: (cause) => cause,
+            }),
+          ),
+        { concurrency: 1 },
+      )
       const listed = yield* git(["worktree", "list", "--porcelain"], info.worktree)
-      const owned =
-        listed.code !== 0
-          ? []
-          : parseWorktreeList(listed.text).flatMap((entry) =>
-              entry.path && normalize(entry.path).startsWith(root)
-                ? [
-                    {
-                      path: entry.path,
-                      branch:
-                        entry.branch?.replace(/^refs\/heads\//, "") ?? recordedBranches.get(normalize(entry.path)),
-                    },
-                  ]
-                : [],
-            )
-      if (owned.length === 0) {
-        yield* rmPath(root)
-        return
-      }
-      for (const entry of owned) {
-        yield* instanceStore.disposeDirectory(entry.path).pipe(Effect.ignore)
-        yield* stopFsmonitor(entry.path)
-        const removed = yield* git(["worktree", "remove", "--force", entry.path], info.worktree)
-        if (removed.code !== 0)
-          return yield* Effect.fail(new Error(`git worktree remove failed for ${entry.path}: ${removed.stderr}`))
-        yield* rmPath(entry.path)
-      }
-      // Prune stale admin entries for dirs already gone from disk.
-      yield* git(["worktree", "prune"], info.worktree).pipe(Effect.ignore)
-
-      // Branch refs are only safe to destroy once git confirms their worktree is
-      // gone; failed removals keep both the admin entry and the branch.
-      const after = yield* git(["worktree", "list", "--porcelain"], info.worktree)
-      const remaining = new Set(
-        after.code !== 0
-          ? []
-          : parseWorktreeList(after.text).flatMap((entry) => (entry.path ? [normalize(entry.path)] : [])),
+      if (listed.code !== 0)
+        return yield* Effect.fail(new Error(`git worktree list failed: ${listed.stderr || listed.text}`))
+      const listedByPath = new Map(
+        parseWorktreeList(listed.text).flatMap((entry) => {
+          if (!entry.path) return []
+          try {
+            return [
+              [
+                identity(
+                  ownedWorktreeTarget({
+                    pathApi: path,
+                    dataRoot: Global.Path.data,
+                    projectID,
+                    candidate: entry.path,
+                  }),
+                ),
+                entry,
+              ] as const,
+            ]
+          } catch {
+            return []
+          }
+        }),
       )
       for (const entry of owned) {
-        if (!entry.branch || remaining.has(normalize(entry.path))) continue
+        const listedEntry = listedByPath.get(identity(entry.canonical_path))
+        if (!listedEntry) {
+          yield* required("worktree_rm", entry.canonical_path, rmPath(entry.canonical_path))
+          continue
+        }
+        yield* required("worktree_dispose", entry.canonical_path, instanceStore.disposeDirectory(entry.canonical_path))
+        yield* required("worktree_fsmonitor", entry.canonical_path, stopFsmonitor(entry.canonical_path))
+        const removed = yield* git(["worktree", "remove", "--force", entry.canonical_path], info.worktree)
+        if (removed.code !== 0) {
+          const afterFailure = yield* git(["worktree", "list", "--porcelain"], info.worktree)
+          if (afterFailure.code !== 0)
+            return yield* Effect.fail(
+              new Error(`git worktree remove failed for ${entry.canonical_path}: ${removed.stderr || removed.text}`),
+            )
+          const stillListed = parseWorktreeList(afterFailure.text).some((candidate) => {
+            if (!candidate.path) return false
+            try {
+              return identity(
+                ownedWorktreeTarget({
+                  pathApi: path,
+                  dataRoot: Global.Path.data,
+                  projectID,
+                  candidate: candidate.path,
+                }),
+              ) === identity(entry.canonical_path)
+            } catch {
+              return false
+            }
+          })
+          if (stillListed)
+            return yield* Effect.fail(
+              new Error(`git worktree remove failed for ${entry.canonical_path}: ${removed.stderr || removed.text}`),
+            )
+        }
+        yield* required("worktree_rm", entry.canonical_path, rmPath(entry.canonical_path))
+      }
+      const after = yield* git(["worktree", "list", "--porcelain"], info.worktree)
+      if (after.code !== 0) return yield* Effect.fail(new Error(`git worktree list failed: ${after.stderr || after.text}`))
+      const remaining = new Set(
+        parseWorktreeList(after.text).flatMap((entry) => {
+          if (!entry.path) return []
+          try {
+            return [
+              identity(
+                ownedWorktreeTarget({ pathApi: path, dataRoot: Global.Path.data, projectID, candidate: entry.path }),
+              ),
+            ]
+          } catch {
+            return []
+          }
+        }),
+      )
+      for (const entry of owned) {
+        if (!entry.branch || remaining.has(identity(entry.canonical_path))) continue
         const deleted = yield* git(["branch", "-D", entry.branch], info.worktree)
         if (deleted.code !== 0)
           return yield* Effect.fail(new Error(`worktree branch delete failed for ${entry.branch}: ${deleted.stderr}`))
       }
-      yield* rmPath(root)
     })
 
     const emitDeleted = Effect.fn("ProjectRemoval.emitDeleted")(function* (id: ProjectV2.ID, eventID: EventV2.ID) {
@@ -250,39 +341,41 @@ const layer = Layer.effect(
       )
 
       // 4. Event aggregates have no FK; no-op where Session.remove already cleaned.
-      yield* Effect.forEach(ids, (id) => events.remove(id).pipe(Effect.ignore), { discard: true })
+      yield* Effect.forEach(ids, (id) => events.remove(id), { discard: true })
 
       // 5. Cached instances for every directory of the project.
-      yield* Effect.forEach(directories, (directory) => instanceStore.disposeDirectory(directory).pipe(Effect.ignore), {
-        discard: true,
-      })
+      yield* Effect.forEach(directories, (directory) => instanceStore.disposeDirectory(directory), { discard: true })
 
       // 6. Artifacts under Global.Path.data only; never inside info.worktree.
       // Keep ProjectTable as immutable retry metadata until every mandatory
       // external cleanup has completed. A failed cleanup can then reconstruct
       // the same target set instead of mistaking a missing row for success.
-      yield* removeGitWorktrees(info)
-      yield* rmPath(path.join(Global.Path.data, "snapshot", info.id))
-      yield* rmPath(path.join(Global.Path.data, "storage", "project", `${info.id}.json`))
-      yield* rmPath(path.join(Global.Path.data, "storage", "session", info.id))
+      yield* removeGitWorktrees(projectID, info)
+      yield* legacyTarget("worktree", info.id, undefined).pipe(Effect.flatMap((target) => required("legacy_worktree", info.id, rmPath(target))))
+      yield* legacyTarget("snapshot", info.id, undefined).pipe(Effect.flatMap((target) => required("legacy_snapshot", info.id, rmPath(target))))
+      yield* legacyTarget("storage-project", info.id, undefined).pipe(
+        Effect.flatMap((target) => required("legacy_project_storage", info.id, rmPath(target))),
+      )
+      yield* legacyTarget("storage-session", info.id, undefined).pipe(
+        Effect.flatMap((target) => required("legacy_session_storage", info.id, rmPath(target))),
+      )
+      yield* required(
+        "snapshot",
+        projectID,
+        rmPath(deletionTarget({ pathApi: path, dataRoot: Global.Path.data, category: "snapshot", projectID })),
+      )
       yield* Effect.forEach(
         artifacts,
         (artifact) =>
-          Effect.try({
-            try: () =>
-              legacyDeletionTarget({
-                pathApi: path,
-                dataRoot: Global.Path.data,
-                category:
-                  artifact.kind === "session_diff"
-                    ? "storage-session-diff"
-                    : artifact.kind === "message"
-                      ? "storage-message"
-                      : "storage-part",
-                relatedID: artifact.id,
-              }),
-            catch: (cause) => cause,
-          }).pipe(Effect.flatMap(rmPath)),
+          legacyTarget(
+            artifact.kind === "session_diff"
+              ? "storage-session-diff"
+              : artifact.kind === "message"
+                ? "storage-message"
+                : "storage-part",
+            undefined,
+            artifact.id,
+          ).pipe(Effect.flatMap((target) => required("legacy_artifact_rm", artifact.id, rmPath(target)))),
         { discard: true },
       )
 
@@ -365,15 +458,19 @@ const layer = Layer.effect(
       )
     })
 
-    const cleanup = Effect.fn("ProjectRemoval.cleanup")(function* (projectID: ProjectV2.ID) {
+    const completeLocalCleanup = Effect.fn("ProjectRemoval.completeLocalCleanup")(function* (projectID: ProjectV2.ID) {
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
-      if (!row) {
-        yield* rmPath(path.join(Global.Path.data, "snapshot", projectID))
-        return
-      }
+      if (!row) return
       const info = Project.fromRow(row)
       yield* purgeScoped(projectID, info)
     })
+
+    const cleanup = (projectID: ProjectV2.ID) =>
+      completeLocalCleanup(projectID).pipe(
+        Effect.mapError((cause) =>
+          cause instanceof RequiredCleanupError ? cause : new RequiredCleanupError("local_cleanup", "project", cause),
+        ),
+      )
 
     coordinator.install({ revokeShares, cleanup, publish: emitDeleted })
     yield* coordinator.recover().pipe(Effect.forkIn(scope))

@@ -54,6 +54,21 @@ export function deletionTarget(input: {
   return requireStrictDescendant(input.pathApi, input.dataRoot, target)
 }
 
+export function ownedWorktreeTarget(input: {
+  pathApi: PathApi
+  dataRoot: string
+  projectID: string
+  candidate: string
+}): string {
+  const root = deletionTarget({
+    pathApi: input.pathApi,
+    dataRoot: input.dataRoot,
+    category: "worktree",
+    projectID: input.projectID,
+  })
+  return requireStrictDescendant(input.pathApi, root, input.candidate)
+}
+
 export function legacyDeletionTarget(input: {
   pathApi: PathApi
   dataRoot: string
