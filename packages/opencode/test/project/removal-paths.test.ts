@@ -3,6 +3,7 @@ import * as fs from "fs/promises"
 import os from "os"
 import path from "path"
 import {
+  UnsafeLegacyMetadataError,
   deletionTarget,
   legacyDeletionTarget,
   opaqueStorageKey,
@@ -59,6 +60,23 @@ describe("project removal paths", () => {
     }
   })
 
+  test("uses opaque components for Win32 worktree and journal targets", () => {
+    for (const input of [
+      { category: "worktree" as const, projectID: "../outside", relatedID: "ses/unsafe" },
+      { category: "journal-artifact" as const, projectID: "C:\\outside", relatedID: "../metadata" },
+    ]) {
+      expect(
+        deletionTarget({
+          pathApi: path.win32,
+          dataRoot: "C:\\Data",
+          ...input,
+        }),
+      ).toBe(
+        `C:\\Data\\project-artifacts\\v1\\${opaqueStorageKey(input.projectID)}\\${input.category}\\${opaqueStorageKey(input.relatedID)}`,
+      )
+    }
+  })
+
   test("maps ordinary legacy identities to the established storage layout", () => {
     const root = "/data"
     expect(
@@ -89,9 +107,27 @@ describe("project removal paths", () => {
     ).toBe("/data/worktree/proj_abc")
   })
 
-  test("rejects traversal, separators, absolute prefixes, NUL, and Windows drives before path construction", () => {
+  test("rejects unsafe metadata for every legacy target before path construction", () => {
+    const targets = [
+      (value: string) => legacyDeletionTarget({ pathApi: path.posix, dataRoot: "/data", category: "storage-project", projectID: value }),
+      (value: string) => legacyDeletionTarget({ pathApi: path.posix, dataRoot: "/data", category: "storage-session", projectID: value }),
+      (value: string) => legacyDeletionTarget({ pathApi: path.posix, dataRoot: "/data", category: "snapshot", projectID: value }),
+      (value: string) => legacyDeletionTarget({ pathApi: path.posix, dataRoot: "/data", category: "worktree", projectID: value }),
+      (value: string) => legacyDeletionTarget({ pathApi: path.posix, dataRoot: "/data", category: "storage-session-diff", relatedID: value }),
+      (value: string) => legacyDeletionTarget({ pathApi: path.posix, dataRoot: "/data", category: "storage-message", relatedID: value }),
+      (value: string) => legacyDeletionTarget({ pathApi: path.posix, dataRoot: "/data", category: "storage-part", relatedID: value }),
+    ]
+
     for (const value of ["../outside", "a/b", "a\\b", "/absolute", "\u0000", "C:\\outside"]) {
-      expect(() => requireLegacyLeaf(value, "project")).toThrow()
+      for (const target of targets) {
+        try {
+          target(value)
+          throw new Error("Expected unsafe legacy metadata to throw")
+        } catch (error) {
+          expect(error).toBeInstanceOf(UnsafeLegacyMetadataError)
+          expect((error as UnsafeLegacyMetadataError).code).toBe("unsafe_legacy_metadata")
+        }
+      }
     }
   })
 })

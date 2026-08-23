@@ -43,6 +43,11 @@ describe("project deletion job migration", () => {
         expect(yield* db.all(sql`SELECT name, pk FROM pragma_table_info('project_deletion_job') WHERE pk > 0 ORDER BY pk`)).toEqual([
           { name: "project_id", pk: 1 },
         ])
+        expect(yield* db.get(sql`SELECT name, "notnull" AS "notnull", pk FROM pragma_table_info('project_deletion_job') WHERE name = 'project_id'`)).toEqual({
+          name: "project_id",
+          notnull: 1,
+          pk: 1,
+        })
         expect(yield* db.all(sql`SELECT name, pk FROM pragma_table_info('project_deletion_share') WHERE pk > 0 ORDER BY pk`)).toEqual([
           { name: "project_id", pk: 1 },
           { name: "session_id", pk: 2 },
@@ -72,6 +77,11 @@ describe("project deletion job migration", () => {
           { name: "project_deletion_share" },
           { name: "project_deletion_worktree" },
         ])
+        expect(yield* db.get(sql`SELECT name, "notnull" AS "notnull", pk FROM pragma_table_info('project_deletion_job') WHERE name = 'project_id'`)).toEqual({
+          name: "project_id",
+          notnull: 1,
+          pk: 1,
+        })
       }),
     )
   })

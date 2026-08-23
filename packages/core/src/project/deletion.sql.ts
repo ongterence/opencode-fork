@@ -38,7 +38,7 @@ export type DeletionWorktree = {
 export const ProjectDeletionJobTable = sqliteTable(
   "project_deletion_job",
   {
-    project_id: text().primaryKey(),
+    project_id: text().notNull().primaryKey(),
     phase: text().$type<DeletionPhase>().notNull(),
     attempt: integer().notNull(),
     last_error: text(),

@@ -25,7 +25,7 @@ export default {
       `)
       yield* tx.run(`
         CREATE TABLE \`project_deletion_job\` (
-          \`project_id\` text PRIMARY KEY,
+          \`project_id\` text PRIMARY KEY NOT NULL,
           \`phase\` text NOT NULL,
           \`attempt\` integer NOT NULL,
           \`last_error\` text,

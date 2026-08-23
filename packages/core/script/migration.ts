@@ -107,7 +107,7 @@ export default { ...config, out: ${JSON.stringify(output)} }
 
 async function generatedMigrations(directory: string) {
   return (await Array.fromAsync(new Bun.Glob("*/migration.sql").scan({ cwd: directory })))
-    .map((file) => file.split("/")[0])
+    .map((file) => file.split(/[\\/]/)[0])
     .filter((name): name is string => name !== undefined)
     .sort()
 }
@@ -146,11 +146,18 @@ import type { DatabaseMigration } from "./migration"
 export default {
   up(tx) {
     return Effect.gen(function* () {
-${renderStatements(sql)}
+${renderStatements(normalizeSchema(sql))}
     })
   },
 } satisfies Omit<DatabaseMigration.Migration, "id">
 `
+}
+
+function normalizeSchema(sql: string) {
+  return sql.replace(
+    /(CREATE TABLE `project_deletion_job` \(\s*`project_id` text PRIMARY KEY)(,)/,
+    "$1 NOT NULL$2",
+  )
 }
 
 function renderStatements(sql: string) {
