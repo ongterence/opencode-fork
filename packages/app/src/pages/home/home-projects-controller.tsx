@@ -8,6 +8,7 @@ import { useNotification } from "@/context/notification"
 import { usePlatform } from "@/context/platform"
 import { ServerConnection } from "@/context/server"
 import { closeHomeProject, errorMessage, homeProjectDirectories } from "@/pages/layout/helpers"
+import { pathKey } from "@/utils/path-key"
 import { Persist, persisted } from "@/utils/persist"
 import { showToast } from "@/utils/toast"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
@@ -105,18 +106,30 @@ export function createHomeProjectsController(home: HomeController) {
         if (next) home.selection.set(next)
       },
       delete: (conn: ServerConnection.Any, project: LocalProject) => {
+        const ctx = home.server.context(conn)
         const projectID = project.id
-        if (!projectID || projectID === "global") return
+        if (projectID === "global") return
+        if (!projectID) {
+          // Stale row: the server no longer knows this project (its data was
+          // already purged, e.g. after a lost response). Only clean it up once
+          // the catalog has loaded and confirms the project is really gone,
+          // otherwise an in-flight catalog would make healthy rows vanish.
+          if (!ctx.sync.data.ready) return
+          const known = ctx.sync.data.project.some(
+            (candidate) => pathKey(candidate.worktree) === pathKey(project.worktree),
+          )
+          if (known) return
+          ctx.projects.remove(project.worktree)
+          return
+        }
         void import("@/components/dialog-delete-project").then(({ DialogDeleteProject }) => {
           void dialog.show(() => (
             <DialogDeleteProject
               name={project.name ?? project.worktree}
               remove={async () => {
-                const ctx = home.server.context(conn)
                 await ctx.sdk.client.global.project.delete({ projectID })
               }}
               onDeleted={() => {
-                const ctx = home.server.context(conn)
                 // remove(), not close(): deletion must never land under Recently closed.
                 ctx.projects.remove(project.worktree)
                 const selection = home.selection.value()
