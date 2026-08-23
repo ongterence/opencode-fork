@@ -120,17 +120,15 @@ function createServerCtx(
 
   function cleanupProject(project: DeleteProjectClientResult) {
     const entry = sync.data.project.find((item) => item.id === project.projectID)
-    const worktrees = new Set([project.worktree, ...(entry?.sandboxes ?? [])].filter(Boolean))
-    if (worktrees.size === 0) worktrees.add("")
-    for (const worktree of worktrees) {
-      cleanupDeletedProjectClientState({
-        project: { projectID: project.projectID, worktree },
-        // remove(), not close(): deletion must never land under Recently closed.
-        removePersisted: projects.remove,
-        forgetProject: sync.forgetProject,
-        removeCatalog: (projectID) => sync.set("project", (items) => items.filter((item) => item.id !== projectID)),
-      })
-    }
+    return cleanupDeletedProjectClientState({
+      project,
+      persisted: [...projects.list()],
+      owner: entry,
+      // remove(), not close(): deletion must never land under Recently closed.
+      removePersisted: projects.remove,
+      forgetProject: sync.forgetProject,
+      removeCatalog: (projectID) => sync.set("project", (items) => items.filter((item) => item.id !== projectID)),
+    })
   }
 
   async function reconcileProjects() {

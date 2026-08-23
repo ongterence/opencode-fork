@@ -209,31 +209,74 @@ export type DeleteProjectClientResult = {
 
 export function cleanupDeletedProjectClientState(input: {
   project: DeleteProjectClientResult
+  persisted: Array<{ worktree: string; expanded: boolean }>
+  owner?: Project
   removePersisted: (worktree: string) => void
   forgetProject: (worktree: string) => void
   removeCatalog: (projectID: string) => void
 }) {
-  if (input.project.worktree) {
-    input.removePersisted(input.project.worktree)
-    input.forgetProject(input.project.worktree)
+  const roots = input.owner
+    ? [input.owner.worktree, ...input.owner.sandboxes].filter(Boolean)
+    : [input.project.worktree].filter(Boolean)
+  const worktrees = new Set(
+    input.persisted.flatMap((project) =>
+      roots.some((root) => projectOwnsDirectory(root, project.worktree)) ? [project.worktree] : [],
+    ),
+  )
+  for (const worktree of worktrees) {
+    input.removePersisted(worktree)
+    input.forgetProject(worktree)
   }
   if (input.project.projectID) input.removeCatalog(input.project.projectID)
+  return roots
 }
 
 export function findStaleProjectRows(input: {
-  persisted: Array<{ worktree: string; id?: string; expanded?: boolean }>
+  persisted: Array<{ worktree: string; expanded: boolean }>
   catalog: Project[]
 }) {
-  const ids = new Set(input.catalog.map((project) => project.id))
-  const directories = new Set(
-    input.catalog.flatMap((project) => [project.worktree, ...project.sandboxes].map(directoryKey)),
-  )
   return input.persisted.flatMap((project) => {
-    const projectID = project.id ?? ""
-    if (projectID && ids.has(projectID)) return []
-    if (directories.has(directoryKey(project.worktree))) return []
-    return [{ projectID, worktree: project.worktree }]
+    if (findProjectDirectoryOwner(input.catalog, project.worktree)) return []
+    return [{ projectID: "", worktree: project.worktree }]
   })
+}
+
+export function findProjectDirectoryOwner(catalog: Project[], directory: string) {
+  return catalog
+    .flatMap((project) =>
+      [project.worktree, ...project.sandboxes].flatMap((root) => {
+        if (!projectOwnsDirectory(root, directory)) return []
+        return [{ project, depth: normalizeOwnershipPath(root).key.length }]
+      }),
+    )
+    .sort((a, b) => b.depth - a.depth)[0]?.project
+}
+
+export function projectOwnsDirectory(root: string, directory: string) {
+  if (!root || !directory) return false
+  const owner = normalizeOwnershipPath(root)
+  const candidate = normalizeOwnershipPath(directory)
+  if (owner.windows !== candidate.windows) return false
+  if (owner.key === candidate.key) return true
+  return candidate.key.startsWith(owner.key.endsWith("/") ? owner.key : owner.key + "/")
+}
+
+function normalizeOwnershipPath(value: string) {
+  const windows = /^[a-z]:([\\/]|$)/i.test(value) || /^[\\/]{2}/.test(value)
+  const normalized = windows ? value.replaceAll("\\", "/") : value
+  const drive = windows && /^[a-z]:/i.test(normalized) ? normalized.slice(0, 2) : ""
+  const absolute = normalized.startsWith("/")
+  const parts = normalized
+    .slice(drive.length)
+    .split("/")
+    .reduce<string[]>((result, part) => {
+      if (!part || part === ".") return result
+      if (part === "..") return result.slice(0, -1)
+      return [...result, part]
+    }, [])
+  const prefix = drive ? drive + "/" : absolute ? (windows ? "//" : "/") : ""
+  const key = prefix + parts.join("/")
+  return { key: windows ? key.toLowerCase() : key, windows }
 }
 
 type ServerSyncOptions = {

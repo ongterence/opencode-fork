@@ -16,31 +16,32 @@ import { createEffect, createResource } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { HomeController } from "./home-controller"
 import type { HomeProjectSelection } from "@/context/layout"
+import { findProjectDirectoryOwner, projectOwnsDirectory } from "@/context/server-sync"
 
 type DeleteProjectClientResult = { worktree: string; projectID: string }
 
 export async function completeProjectDelete(input: {
   request: () => Promise<void>
-  cleanup: (project: DeleteProjectClientResult) => void
+  cleanup: (project: DeleteProjectClientResult) => string[]
   project: DeleteProjectClientResult
   serverKey: ServerConnection.Key
   selection: () => HomeProjectSelection
   setSelection: (next: HomeProjectSelection) => void
 }) {
   await input.request()
-  input.cleanup(input.project)
-  resetDeletedProjectSelection(input)
+  const roots = input.cleanup(input.project)
+  resetDeletedProjectSelection({ ...input, roots })
 }
 
 function resetDeletedProjectSelection(input: {
-  project: Pick<DeleteProjectClientResult, "worktree">
+  roots: string[]
   serverKey: ServerConnection.Key
   selection: () => HomeProjectSelection
   setSelection: (next: HomeProjectSelection) => void
 }) {
   const selection = input.selection()
   if (selection.server !== input.serverKey) return
-  if (pathKey(selection.directory ?? "") !== pathKey(input.project.worktree)) return
+  if (!input.roots.some((root) => projectOwnsDirectory(root, selection.directory ?? ""))) return
   input.setSelection({ server: input.serverKey })
 }
 
@@ -155,13 +156,11 @@ export function createHomeProjectsController(home: HomeController) {
           // the catalog has loaded and confirms the project is really gone,
           // otherwise an in-flight catalog would make healthy rows vanish.
           if (!ctx.sync.data.ready) return
-          const known = ctx.sync.data.project.some(
-            (candidate) => pathKey(candidate.worktree) === pathKey(project.worktree),
-          )
+          const known = findProjectDirectoryOwner(ctx.sync.data.project, project.worktree)
           if (known) return
-          ctx.cleanupProject({ projectID: "", worktree: project.worktree })
+          const roots = ctx.cleanupProject({ projectID: "", worktree: project.worktree })
           resetDeletedProjectSelection({
-            project,
+            roots,
             serverKey: ServerConnection.key(conn),
             selection: home.selection.value,
             setSelection: home.selection.set,

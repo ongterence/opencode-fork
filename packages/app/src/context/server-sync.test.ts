@@ -25,53 +25,83 @@ import type { ServerApi } from "@/utils/server"
 type McpApi = ServerApi["mcp"]
 
 describe("deleted project reconciliation", () => {
-  test("cleans persisted, child, and catalog state idempotently without closing", () => {
+  test("cleans every persisted alias owned by one deleted catalog project", () => {
     const calls: string[] = []
-    const catalog = [{ id: "project-1", worktree: "/project" }]
-    const cleanup = () =>
-      cleanupDeletedProjectClientState({
-        project: { projectID: "project-1", worktree: "/project" },
-        removePersisted(worktree) {
-          calls.push("remove:" + worktree)
-        },
-        forgetProject(worktree) {
-          calls.push("forget:" + worktree)
-        },
-        removeCatalog(projectID) {
-          calls.push("catalog:" + projectID)
-          const index = catalog.findIndex((item) => item.id === projectID)
-          if (index !== -1) catalog.splice(index, 1)
-        },
-      })
+    const persisted = [
+      { worktree: "/repo", expanded: true },
+      { worktree: "/repo/packages/app", expanded: false },
+      { worktree: "/tmp/repo-sandbox/packages/ui", expanded: true },
+      { worktree: "/keep", expanded: true },
+    ]
+    const owner = {
+      id: "project-1",
+      worktree: "/repo",
+      sandboxes: ["/tmp/repo-sandbox"],
+      time: { created: 1, updated: 1 },
+    } satisfies Project
 
-    cleanup()
-    cleanup()
+    const roots = cleanupDeletedProjectClientState({
+      project: { projectID: "project-1", worktree: "/repo" },
+      persisted: [...persisted],
+      owner,
+      removePersisted(worktree) {
+        calls.push("remove:" + worktree)
+      },
+      forgetProject(worktree) {
+        calls.push("forget:" + worktree)
+      },
+      removeCatalog(projectID) {
+        calls.push("catalog:" + projectID)
+      },
+    })
 
     expect(calls).toEqual([
-      "remove:/project",
-      "forget:/project",
-      "catalog:project-1",
-      "remove:/project",
-      "forget:/project",
+      "remove:/repo",
+      "forget:/repo",
+      "remove:/repo/packages/app",
+      "forget:/repo/packages/app",
+      "remove:/tmp/repo-sandbox/packages/ui",
+      "forget:/tmp/repo-sandbox/packages/ui",
       "catalog:project-1",
     ])
-    expect(catalog).toEqual([])
+    expect(roots).toEqual(["/repo", "/tmp/repo-sandbox"])
   })
 
-  test("finds only persisted rows absent from the authoritative catalog", () => {
+  test("retains nested project and sandbox aliases during authoritative reconciliation", () => {
     expect(
       findStaleProjectRows({
         persisted: [
-          { worktree: "/keep", expanded: true },
-          { id: "deleted", worktree: "/deleted", expanded: true },
-          { worktree: "/keep-sandbox", expanded: true },
+          { worktree: "/repo/packages/app", expanded: true },
+          { worktree: "/tmp/repo-sandbox/packages/ui", expanded: true },
+          { worktree: "/repo-other", expanded: true },
         ],
         catalog: [
-          { id: "keep", worktree: "/keep", sandboxes: ["/keep-sandbox"], time: { created: 1, updated: 1 } },
-          { id: "other", worktree: "/other", sandboxes: [], time: { created: 1, updated: 1 } },
+          {
+            id: "keep",
+            worktree: "/repo/",
+            sandboxes: ["/tmp/repo-sandbox/"],
+            time: { created: 1, updated: 1 },
+          },
         ] satisfies Project[],
       }),
-    ).toEqual([{ projectID: "deleted", worktree: "/deleted" }])
+    ).toEqual([{ projectID: "", worktree: "/repo-other" }])
+  })
+
+  test("preserves POSIX case and folds Windows drive and UNC case", () => {
+    expect(
+      findStaleProjectRows({
+        persisted: [
+          { worktree: "/Repo/packages/app", expanded: true },
+          { worktree: "c:\\repo\\packages\\app", expanded: true },
+          { worktree: "\\\\SERVER\\SHARE\\REPO\\packages\\app", expanded: true },
+        ],
+        catalog: [
+          { id: "posix", worktree: "/repo", sandboxes: [], time: { created: 1, updated: 1 } },
+          { id: "drive", worktree: "C:\\Repo", sandboxes: [], time: { created: 1, updated: 1 } },
+          { id: "unc", worktree: "\\\\server\\share\\repo", sandboxes: [], time: { created: 1, updated: 1 } },
+        ] satisfies Project[],
+      }),
+    ).toEqual([{ projectID: "", worktree: "/Repo/packages/app" }])
   })
 })
 
