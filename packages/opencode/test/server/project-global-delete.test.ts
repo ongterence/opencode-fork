@@ -924,6 +924,37 @@ describe("global project delete endpoint", () => {
   )
 
   it.instance(
+    "removes a missing sandbox that remains registered by git with its original branch",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const worktree = path.join(
+          deletionTarget({
+            pathApi: path,
+            dataRoot: Global.Path.data,
+            category: "worktree",
+            projectID: project.id,
+          }),
+          "missing-registered",
+        )
+        const { db } = yield* Database.Service
+        yield* Effect.promise(() => $`git worktree add -b deletion-missing-registered ${worktree}`.cwd(tmp.directory).quiet())
+        yield* db.run(sql`UPDATE project SET sandboxes = ${JSON.stringify([worktree])} WHERE id = ${project.id}`).pipe(Effect.orDie)
+        yield* Effect.promise(async () => (await import("node:fs/promises")).rm(worktree, { recursive: true, force: true }))
+
+        const removed = yield* request(`/global/project/${project.id}`, { method: "DELETE" })
+        expect(removed.status).toBe(204)
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, project.id)).get().pipe(Effect.orDie),
+        ).toBeUndefined()
+        expect((yield* Effect.promise(() => $`git show-ref --verify --quiet refs/heads/deletion-missing-registered`.cwd(tmp.directory).quiet().nothrow())).exitCode).not.toBe(0)
+      }),
+    { git: true },
+  )
+
+  it.instance(
     "retains the journal when git cannot spawn the show-ref confirmation after branch deletion fails",
     () =>
       Effect.gen(function* () {

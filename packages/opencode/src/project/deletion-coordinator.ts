@@ -77,7 +77,7 @@ export type MakeOptions = {
   readonly recoveryAttempts?: number
   readonly recoveryDelay?: Duration.Input
   readonly afterPublish?: () => Effect.Effect<void, unknown>
-  readonly worktreeBranch?: (directory: string) => Effect.Effect<string | null, unknown>
+  readonly worktreeBranch?: (input: { directory: string; worktree: string }) => Effect.Effect<string | null, unknown>
 }
 
 export function make(options: MakeOptions = {}) {
@@ -472,7 +472,10 @@ export function make(options: MakeOptions = {}) {
                       })
                       .filter((item, index, all) => all.findIndex((other) => other.path === item.path) === index)
                     const ownedWorktrees = yield* Effect.forEach(paths, (item) =>
-                      worktreeBranch(item.path).pipe(Effect.map((branch) => ({ ...item, branch }))),
+                      worktreeBranch({ directory: item.path, worktree: project.worktree }).pipe(
+                        Effect.orDie,
+                        Effect.map((branch) => ({ ...item, branch })),
+                      ),
                     )
                     if (ownedWorktrees.length > 0)
                       yield* tx
@@ -604,7 +607,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     return yield* make({
-      worktreeBranch: (directory) =>
+      worktreeBranch: ({ directory, worktree }) =>
         Effect.gen(function* () {
           const exists = yield* Effect.try({
             try: () => {
@@ -618,22 +621,32 @@ const layer = Layer.effect(
             },
             catch: (cause) => cause,
           })
-          if (!exists) return null
-          const handle = yield* spawner.spawn(
-            ChildProcess.make("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
-              cwd: directory,
-              extendEnv: true,
-              stdin: "ignore",
-            }),
-          )
-          const [text, stderr] = yield* Effect.all(
-            [Stream.mkString(Stream.decodeText(handle.stdout)), Stream.mkString(Stream.decodeText(handle.stderr))],
-            { concurrency: 2 },
-          )
-          const code = yield* handle.exitCode
-          if (code === 0 && text.trim()) return text.trim()
-          if (code === 1 && !text.trim() && !stderr.trim()) return null
-          return yield* Effect.fail(new Error(`git branch snapshot failed for ${directory}: ${stderr || text}`))
+          const git = Effect.fnUntraced(function* (args: string[], cwd: string) {
+            const handle = yield* spawner.spawn(
+              ChildProcess.make("git", args, {
+                cwd,
+                extendEnv: true,
+                stdin: "ignore",
+              }),
+            )
+            const [text, stderr] = yield* Effect.all(
+              [Stream.mkString(Stream.decodeText(handle.stdout)), Stream.mkString(Stream.decodeText(handle.stderr))],
+              { concurrency: 2 },
+            )
+            return { code: yield* handle.exitCode, text, stderr }
+          })
+          if (!exists) {
+            const listed = yield* git(["worktree", "list", "--porcelain"], worktree)
+            if (listed.code !== 0)
+              return yield* Effect.fail(new Error(`git worktree snapshot failed for ${worktree}: ${listed.stderr || listed.text}`))
+            const identity = (value: string) => (process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value))
+            const entry = parseWorktreeList(listed.text).find((item) => item.path && identity(item.path) === identity(directory))
+            return entry?.branch ? entry.branch.replace(/^refs\/heads\//, "") : null
+          }
+          const result = yield* git(["symbolic-ref", "--quiet", "--short", "HEAD"], directory)
+          if (result.code === 0 && result.text.trim()) return result.text.trim()
+          if (result.code === 1 && !result.text.trim() && !result.stderr.trim()) return null
+          return yield* Effect.fail(new Error(`git branch snapshot failed for ${directory}: ${result.stderr || result.text}`))
         }).pipe(Effect.scoped),
     })
   }),
@@ -641,6 +654,15 @@ const layer = Layer.effect(
 
 function isNotFound(cause: unknown) {
   return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT"
+}
+
+function parseWorktreeList(text: string) {
+  const entries: { path?: string; branch?: string }[] = []
+  for (const line of text.split("\n")) {
+    if (line.startsWith("worktree ")) entries.push({ path: line.slice("worktree ".length) })
+    else if (line.startsWith("branch ") && entries.length > 0) entries[entries.length - 1].branch = line.slice("branch ".length)
+  }
+  return entries
 }
 
 export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, CrossSpawnSpawner.node] })
