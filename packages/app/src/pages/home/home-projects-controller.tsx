@@ -183,6 +183,18 @@ export function createHomeProjectsController(home: HomeController) {
                   setSelection: home.selection.set,
                 })
               }}
+              retry={async () => {
+                await completeProjectDelete({
+                  request: async () => {
+                    await ctx.sdk.client.global.project.delete2.retry({ projectID })
+                  },
+                  cleanup: ctx.cleanupProject,
+                  project: { projectID, worktree: project.worktree },
+                  serverKey: ServerConnection.key(conn),
+                  selection: home.selection.value,
+                  setSelection: home.selection.set,
+                })
+              }}
               onDeleted={() => {}}
             />
           ))

@@ -31,6 +31,7 @@ const Context = createContext<ReturnType<typeof init>>()
 
 function init() {
   const [stack, setStack] = createSignal<Active[]>([])
+  const [closeBlocked, setCloseBlocked] = createSignal(false)
   const timer = { current: undefined as ReturnType<typeof setTimeout> | undefined }
   const lock = { value: false }
 
@@ -41,6 +42,7 @@ function init() {
   })
 
   const close = (id?: string) => {
+    if (closeBlocked()) return
     const items = stack()
     const current = id ? items.find((item) => item.id === id) : items.at(-1)
     if (!current || lock.value) return
@@ -133,6 +135,7 @@ function init() {
       timer.current = undefined
     }
     lock.value = false
+    setCloseBlocked(false)
     mount(element, owner, onClose, stack().length)
   }
 
@@ -144,12 +147,14 @@ function init() {
       timer.current = undefined
     }
     lock.value = false
+    setCloseBlocked(false)
     mount(element, owner, onClose, 0)
   }
 
   return {
     stack,
     close,
+    setCloseBlocked,
     show,
     push,
   }
@@ -192,6 +197,9 @@ export function useDialog() {
     },
     close() {
       ctx.close()
+    },
+    setCloseBlocked(blocked: boolean) {
+      ctx.setCloseBlocked(blocked)
     },
   }
 }

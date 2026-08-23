@@ -1184,6 +1184,11 @@ export const dict = {
 
   "project.delete.failed.title": "Failed to delete project",
   "project.delete.title": "Delete project",
-  "project.delete.confirm": "Delete \"{{name}}\"? All sessions and OpenCode data for this project will be permanently removed.",
+  "project.delete.confirm":
+    "Delete \"{{name}}\"? All sessions and OpenCode data for this project will be permanently removed. Files in the project folder will not be deleted.",
+  "project.delete.acknowledge": "Type DELETE to confirm",
+  "project.delete.progress": "Deleting project data…",
+  "project.delete.retryable": "Remote share revocation must finish before this project can be deleted.",
+  "project.delete.retry": "Retry",
   "project.delete.button": "Delete project",
 }
