@@ -11,9 +11,35 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
-import { ProjectDeletionInProgressError, ProjectNotFoundError, ProjectNotRemovableError } from "../errors"
+import {
+  ProjectDeletionInProgressError,
+  ProjectDeletionRetryableError,
+  ProjectNotFoundError,
+  ProjectNotRemovableError,
+} from "../errors"
 import { GlobalUpgradeInput } from "../groups/global"
 import { ProjectRemoval } from "@/project/removal"
+
+function projectDeletionFailure(error: { projectID: string; phase: string }) {
+  if (error.phase === "share_failed")
+    return Effect.fail(
+      new ProjectDeletionRetryableError({
+        projectID: error.projectID,
+        phase: "share_failed",
+        code: "project_deletion_retryable",
+        retry: true,
+        message: "Project deletion is waiting to retry remote share revocation",
+      }),
+    )
+  return Effect.fail(
+    new ProjectDeletionInProgressError({
+      projectID: error.projectID,
+      phase: error.phase,
+      code: "project_deletion_in_progress",
+      message: "Project deletion is in progress",
+    }),
+  )
+}
 
 function eventData(data: unknown): Sse.Event {
   return {
@@ -107,16 +133,21 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
             new ProjectNotRemovableError({ projectID: ctx.params.projectID, message: "This project cannot be deleted" }),
           ),
         ),
-        Effect.catchTag("ProjectDeletingError", (error) =>
+        Effect.catchTag("ProjectDeletingError", projectDeletionFailure),
+      )
+    })
+
+    const projectDeleteRetry = Effect.fn("GlobalHttpApi.projectDeleteRetry")(function* (ctx) {
+      yield* removal.retry(ctx.params.projectID).pipe(
+        Effect.catchTag("Project.NotFoundError", () =>
+          Effect.fail(new ProjectNotFoundError({ projectID: ctx.params.projectID, message: "Project not found" })),
+        ),
+        Effect.catchTag("Project.NotRemovableError", () =>
           Effect.fail(
-            new ProjectDeletionInProgressError({
-              projectID: error.projectID,
-              phase: error.phase,
-              code: "project_deletion_in_progress",
-              message: "Project deletion is in progress",
-            }),
+            new ProjectNotRemovableError({ projectID: ctx.params.projectID, message: "This project cannot be deleted" }),
           ),
         ),
+        Effect.catchTag("ProjectDeletingError", projectDeletionFailure),
       )
     })
 
@@ -178,6 +209,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handle("configUpdate", configUpdate)
       .handle("dispose", dispose)
       .handle("projectDelete", projectDelete)
+      .handle("projectDeleteRetry", projectDeleteRetry)
       .handleRaw("upgrade", upgradeRaw)
   }),
 )

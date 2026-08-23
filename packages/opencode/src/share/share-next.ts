@@ -20,7 +20,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { EventV2 } from "@opencode-ai/core/event"
 
-const disabled = process.env["OPENCODE_DISABLE_SHARE"] === "true" || process.env["OPENCODE_DISABLE_SHARE"] === "1"
+const disabled = () => process.env["OPENCODE_DISABLE_SHARE"] === "true" || process.env["OPENCODE_DISABLE_SHARE"] === "1"
 
 export type RemoteShareCredential = { sessionID: SessionID; shareID: string; secret: string; baseUrl: string }
 export type RevokeResult = "revoked" | "already_absent"
@@ -136,7 +136,7 @@ const layer = Layer.effect(
 
     function sync(sessionID: SessionID, data: Data[]) {
       return Effect.gen(function* () {
-        if (disabled) return
+        if (disabled()) return
         const share = yield* getCached(sessionID)
         if (!share) return
 
@@ -174,7 +174,7 @@ const layer = Layer.effect(
           ),
         )
 
-        if (disabled) return cache
+        if (disabled()) return cache
 
         const watch = <D extends EventV2.Definition>(
           def: D,
@@ -258,7 +258,7 @@ const layer = Layer.effect(
     })
 
     const flush = Effect.fn("ShareNext.flush")(function* (sessionID: SessionID) {
-      if (disabled) return
+      if (disabled()) return
       const s = yield* InstanceState.get(state)
       const queued = s.queue.get(sessionID)
       if (!queued) return
@@ -312,7 +312,7 @@ const layer = Layer.effect(
     })
 
     const init = Effect.fn("ShareNext.init")(function* () {
-      if (disabled) return
+      if (disabled()) return
       yield* InstanceState.get(state)
     })
 
@@ -321,7 +321,7 @@ const layer = Layer.effect(
     })
 
     const create = Effect.fn("ShareNext.create")(function* (sessionID: SessionID) {
-      if (disabled) return { id: "", url: "", secret: "" }
+      if (disabled()) return { id: "", url: "", secret: "" }
       yield* Effect.logInfo("creating share", { sessionID: sessionID })
       const result = yield* session.withMutation(
         sessionID,
@@ -355,7 +355,7 @@ const layer = Layer.effect(
     })
 
     const remove = Effect.fn("ShareNext.remove")(function* (sessionID: SessionID) {
-      if (disabled) return
+      if (disabled()) return
       yield* Effect.logInfo("removing share", { sessionID: sessionID })
       const s = yield* InstanceState.get(state)
       const share = yield* getCached(sessionID)

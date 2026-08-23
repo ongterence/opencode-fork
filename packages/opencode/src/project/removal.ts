@@ -39,6 +39,9 @@ export interface Interface {
   readonly remove: (
     projectID: ProjectV2.ID,
   ) => Effect.Effect<void, Project.NotFoundError | NotRemovableError | ProjectDeletingError>
+  readonly retry: (
+    projectID: ProjectV2.ID,
+  ) => Effect.Effect<void, Project.NotFoundError | NotRemovableError | ProjectDeletingError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ProjectRemoval") {}
@@ -381,7 +384,13 @@ const layer = Layer.effect(
       return yield* new ProjectDeletingError({ projectID, phase: outcome.phase })
     })
 
-    return Service.of({ remove })
+    const retry = Effect.fn("ProjectRemoval.retry")(function* (projectID: ProjectV2.ID) {
+      const outcome = yield* coordinator.retry(projectID)
+      if (outcome.status === "completed") return
+      return yield* new ProjectDeletingError({ projectID, phase: outcome.phase })
+    })
+
+    return Service.of({ remove, retry })
   }),
 )
 

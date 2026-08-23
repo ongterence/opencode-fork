@@ -7,7 +7,12 @@ import "@opencode-ai/core/account"
 import "@/server/event"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
-import { ProjectDeletionInProgressError, ProjectNotFoundError, ProjectNotRemovableError } from "../errors"
+import {
+  ProjectDeletionInProgressError,
+  ProjectDeletionRetryableError,
+  ProjectNotFoundError,
+  ProjectNotRemovableError,
+} from "../errors"
 import { described } from "./metadata"
 
 const GlobalHealth = Schema.Struct({
@@ -71,6 +76,7 @@ export const GlobalPaths = {
   dispose: "/global/dispose",
   upgrade: "/global/upgrade",
   projectDelete: "/global/project/:projectID",
+  projectDeleteRetry: "/global/project/:projectID/delete/retry",
 } as const
 
 export const GlobalApi = HttpApi.make("global").add(
@@ -137,13 +143,24 @@ export const GlobalApi = HttpApi.make("global").add(
       HttpApiEndpoint.delete("projectDelete", GlobalPaths.projectDelete, {
         params: { projectID: ProjectV2.ID },
         success: HttpApiSchema.NoContent,
-        error: [ProjectNotFoundError, ProjectNotRemovableError, ProjectDeletionInProgressError],
+        error: [ProjectNotFoundError, ProjectNotRemovableError, ProjectDeletionInProgressError, ProjectDeletionRetryableError],
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.project.delete",
           summary: "Delete a project",
           description:
             "Permanently remove all OpenCode-owned data for a project: sessions, history, workspaces, permissions and caches under the OpenCode data directory. Never deletes files inside the project directory.",
+        }),
+      ),
+      HttpApiEndpoint.post("projectDeleteRetry", GlobalPaths.projectDeleteRetry, {
+        params: { projectID: ProjectV2.ID },
+        success: HttpApiSchema.NoContent,
+        error: [ProjectNotFoundError, ProjectNotRemovableError, ProjectDeletionInProgressError, ProjectDeletionRetryableError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.project.delete.retry",
+          summary: "Retry failed project deletion share revocation",
+          description: "Retries a project deletion only after a retained remote share revocation failure.",
         }),
       ),
     )

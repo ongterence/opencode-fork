@@ -218,6 +218,10 @@ describe("ShareNext", () => {
         return Effect.succeed(HttpClientResponse.fromWeb(req, new Response(null, { status: 204 })))
       })
       return Effect.gen(function* () {
+        const previous = process.env["OPENCODE_DISABLE_SHARE"]
+        yield* Effect.sync(() => {
+          process.env["OPENCODE_DISABLE_SHARE"] = "1"
+        })
         const result = yield* ShareNext.Service.use((svc) =>
           svc.revokeHistorical({
             sessionID: "ses_historical" as SessionID,
@@ -225,6 +229,13 @@ describe("ShareNext", () => {
             secret: "sec_123",
             baseUrl: "https://legacy-share.example.com",
           }),
+        ).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (previous === undefined) delete process.env["OPENCODE_DISABLE_SHARE"]
+              else process.env["OPENCODE_DISABLE_SHARE"] = previous
+            }),
+          ),
         )
 
         expect(result).toBe("revoked")

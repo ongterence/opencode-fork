@@ -14,7 +14,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
-import { eq, inArray, sql } from "drizzle-orm"
+import { and, eq, inArray, sql } from "drizzle-orm"
 import { Cause, Context, Deferred, Duration, Effect, Exit, Layer, Schema } from "effect"
 import { NotFoundError, NotRemovableError } from "./project-errors"
 
@@ -41,6 +41,7 @@ export interface DeletionActions {
 
 export interface Interface {
   readonly begin: (projectID: ProjectV2.ID) => Effect.Effect<"owner" | "in_progress", NotFoundError | NotRemovableError>
+  readonly retry: (projectID: ProjectV2.ID) => Effect.Effect<DeleteOutcome>
   readonly execute: (projectID: ProjectV2.ID) => Effect.Effect<DeleteOutcome>
   readonly runOwned: (projectID: ProjectV2.ID) => Effect.Effect<DeleteOutcome, NotFoundError | NotRemovableError>
   readonly assertWritable: (projectID: ProjectV2.ID) => Effect.Effect<void, ProjectDeletingError>
@@ -326,6 +327,51 @@ export function make(options: MakeOptions = {}) {
         (owner) => (owner === "owner" ? releaseOwner(projectID) : Effect.void),
       )
 
+    const retry: Interface["retry"] = (projectID) =>
+      Effect.acquireUseRelease(
+        gates.withLock(projectID)(
+          Effect.gen(function* () {
+            if (admissionClosed || owners.has(projectID) || closing.has(projectID)) return "in_progress" as const
+            const claimed = yield* db
+              .transaction(
+                (tx) =>
+                  Effect.gen(function* () {
+                    const current = yield* tx
+                      .select({ phase: ProjectDeletionJobTable.phase })
+                      .from(ProjectDeletionJobTable)
+                      .where(eq(ProjectDeletionJobTable.project_id, projectID))
+                      .get()
+                    if (!current || current.phase !== "share_failed") return false
+                    yield* tx
+                      .update(ProjectDeletionJobTable)
+                      .set({ phase: "revoking_shares", updated_at: Date.now() })
+                      .where(
+                        and(
+                          eq(ProjectDeletionJobTable.project_id, projectID),
+                          eq(ProjectDeletionJobTable.phase, "share_failed"),
+                        ),
+                      )
+                      .run()
+                    return true
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie)
+            if (!claimed) return "in_progress" as const
+            closing.add(projectID)
+            owners.set(projectID, Deferred.makeUnsafe<void>())
+            return "owner" as const
+          }),
+        ),
+        (owner) =>
+          owner === "owner"
+            ? execute(projectID)
+            : phase(projectID).pipe(
+                Effect.map((current) => ({ status: "in_progress", phase: current?.phase ?? "requested" }) as const),
+              ),
+        (owner) => (owner === "owner" ? releaseOwner(projectID) : Effect.void),
+      )
+
     const begin: Interface["begin"] = (projectID) =>
       Effect.suspend(() => {
         let installed = false
@@ -507,6 +553,7 @@ export function make(options: MakeOptions = {}) {
 
     return Service.of({
       begin,
+      retry,
       execute,
       runOwned,
       assertWritable,
