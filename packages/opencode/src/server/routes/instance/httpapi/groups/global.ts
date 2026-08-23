@@ -7,7 +7,7 @@ import "@opencode-ai/core/account"
 import "@/server/event"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
-import { ProjectNotFoundError, ProjectNotRemovableError } from "../errors"
+import { ProjectDeletionInProgressError, ProjectNotFoundError, ProjectNotRemovableError } from "../errors"
 import { described } from "./metadata"
 
 const GlobalHealth = Schema.Struct({
@@ -137,7 +137,7 @@ export const GlobalApi = HttpApi.make("global").add(
       HttpApiEndpoint.delete("projectDelete", GlobalPaths.projectDelete, {
         params: { projectID: ProjectV2.ID },
         success: HttpApiSchema.NoContent,
-        error: [ProjectNotFoundError, ProjectNotRemovableError],
+        error: [ProjectNotFoundError, ProjectNotRemovableError, ProjectDeletionInProgressError],
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.project.delete",

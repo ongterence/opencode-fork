@@ -44,6 +44,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
+import { ProjectDeletionCoordinator } from "@/project/deletion-coordinator"
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -471,6 +472,11 @@ export interface Interface {
     sessionID: SessionID,
     predicate: (msg: SessionV1.WithParts) => boolean,
   ) => Effect.Effect<Option.Option<SessionV1.WithParts>, NotFound>
+  readonly assertWritable: (sessionID: SessionID) => Effect.Effect<void>
+  readonly lease: (
+    sessionID: SessionID,
+    cancel: () => Effect.Effect<unknown, unknown>,
+  ) => Effect.Effect<Effect.Effect<void>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Session") {}
@@ -488,7 +494,11 @@ export type Patch = Omit<Partial<Info>, "time" | "share" | "summary" | "revert" 
 const layer: Layer.Layer<
   Service,
   never,
-  BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+  | BackgroundJob.Service
+  | RuntimeFlags.Service
+  | Database.Service
+  | EventV2Bridge.Service
+  | ProjectDeletionCoordinator.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -497,6 +507,32 @@ const layer: Layer.Layer<
     const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const deletion = yield* ProjectDeletionCoordinator.Service
+
+    const assertWritable = Effect.fn("Session.assertWritable")(function* (sessionID: SessionID) {
+      const row = yield* db
+        .select({ projectID: SessionTable.project_id })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      if (!row) return
+      yield* deletion.assertWritable(row.projectID).pipe(Effect.orDie)
+    })
+
+    const lease = Effect.fn("Session.lease")(function* (
+      sessionID: SessionID,
+      cancel: () => Effect.Effect<unknown, unknown>,
+    ) {
+      const row = yield* db
+        .select({ projectID: SessionTable.project_id })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      if (!row) return Effect.void
+      return yield* deletion.lease(row.projectID, `session:${sessionID}`, cancel).pipe(Effect.orDie)
+    })
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -534,6 +570,7 @@ const layer: Layer.Layer<
       }
       yield* Effect.logInfo("created", result)
 
+      yield* deletion.assertWritable(result.projectID).pipe(Effect.orDie)
       yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
 
       return result
@@ -630,12 +667,14 @@ const layer: Layer.Layer<
 
     const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        yield* assertWritable(msg.sessionID)
         yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: msg.sessionID, info: msg })
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        yield* assertWritable(part.sessionID)
         yield* events.publish(SessionV1.Event.PartUpdated, {
           sessionID: part.sessionID,
           part: structuredClone(part),
@@ -735,6 +774,7 @@ const layer: Layer.Layer<
 
     const patch = (sessionID: SessionID, info: Patch) =>
       Effect.gen(function* () {
+        yield* assertWritable(sessionID)
         const current = yield* get(sessionID)
         const next = {
           ...current,
@@ -856,6 +896,7 @@ const layer: Layer.Layer<
       sessionID: SessionID
       messageID: MessageID
     }) {
+      yield* assertWritable(input.sessionID)
       yield* events.publish(SessionV1.Event.MessageRemoved, {
         sessionID: input.sessionID,
         messageID: input.messageID,
@@ -868,6 +909,7 @@ const layer: Layer.Layer<
       messageID: MessageID
       partID: PartID
     }) {
+      yield* assertWritable(input.sessionID)
       yield* events.publish(SessionV1.Event.PartRemoved, {
         sessionID: input.sessionID,
         messageID: input.messageID,
@@ -883,6 +925,7 @@ const layer: Layer.Layer<
       field: string
       delta: string
     }) {
+      yield* assertWritable(input.sessionID)
       yield* events.publish(MessageV2.Event.PartDelta, input)
     })
 
@@ -933,6 +976,8 @@ const layer: Layer.Layer<
       getPart,
       updatePartDelta,
       findMessage,
+      assertWritable,
+      lease,
     })
   }),
 )
@@ -1012,7 +1057,7 @@ function listByProject(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node, ProjectDeletionCoordinator.node],
 })
 
 export * as Session from "./session"

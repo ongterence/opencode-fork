@@ -184,6 +184,17 @@ export class ProjectNotRemovableError extends Schema.TaggedErrorClass<ProjectNot
   { httpApiStatus: 400 },
 ) {}
 
+export class ProjectDeletionInProgressError extends Schema.TaggedErrorClass<ProjectDeletionInProgressError>()(
+  "ProjectDeletionInProgressError",
+  {
+    projectID: Schema.String,
+    phase: Schema.String,
+    code: Schema.Literal("project_deletion_in_progress"),
+    message: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {}
+
 export class ApiNotFoundError extends Schema.ErrorClass<ApiNotFoundError>("NotFoundError")(
   {
     name: Schema.Literal("NotFoundError"),

@@ -5,6 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { ProjectDeletionJobTable } from "@opencode-ai/core/project/deletion.sql"
 import { Effect, Layer } from "effect"
 import path from "path"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
@@ -104,5 +105,39 @@ describe("global project delete endpoint", () => {
       const guarded = yield* request("/global/project/global", { method: "DELETE" })
       expect(guarded.status).toBe(400)
     }),
+  )
+
+  it.instance(
+    "returns conflict while a durable deletion is already in progress",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: string }
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(ProjectDeletionJobTable)
+          .values({
+            project_id: project.id,
+            phase: "revoking_shares",
+            attempt: 0,
+            last_error: null,
+            created_at: 1,
+            updated_at: 1,
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        const response = yield* request(`/global/project/${project.id}`, { method: "DELETE" })
+        expect(response.status).toBe(409)
+        expect(yield* response.json).toEqual({
+          _tag: "ProjectDeletionInProgressError",
+          projectID: project.id,
+          phase: "revoking_shares",
+          code: "project_deletion_in_progress",
+          message: "Project deletion is in progress",
+        })
+      }),
+    { git: true },
   )
 })

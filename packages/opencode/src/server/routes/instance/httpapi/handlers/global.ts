@@ -11,7 +11,7 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
-import { ProjectNotFoundError, ProjectNotRemovableError } from "../errors"
+import { ProjectDeletionInProgressError, ProjectNotFoundError, ProjectNotRemovableError } from "../errors"
 import { GlobalUpgradeInput } from "../groups/global"
 import { ProjectRemoval } from "@/project/removal"
 
@@ -105,6 +105,16 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
         Effect.catchTag("Project.NotRemovableError", () =>
           Effect.fail(
             new ProjectNotRemovableError({ projectID: ctx.params.projectID, message: "This project cannot be deleted" }),
+          ),
+        ),
+        Effect.catchTag("ProjectDeletingError", (error) =>
+          Effect.fail(
+            new ProjectDeletionInProgressError({
+              projectID: error.projectID,
+              phase: error.phase,
+              code: "project_deletion_in_progress",
+              message: "Project deletion is in progress",
+            }),
           ),
         ),
       )

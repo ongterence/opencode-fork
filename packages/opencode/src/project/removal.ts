@@ -10,7 +10,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
-import { Context, Effect, Layer, Schedule, Schema } from "effect"
+import { Context, Effect, Layer, Schedule, Scope } from "effect"
 import { existsSync } from "fs"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import * as Stream from "effect/Stream"
@@ -22,16 +22,17 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { ShareNext } from "@/share/share-next"
-import { type InstanceContext } from "./instance-context"
 import { InstanceStore } from "./instance-store"
 import * as Project from "./project"
+import { ProjectDeletingError, ProjectDeletionCoordinator } from "./deletion-coordinator"
+import { NotRemovableError } from "./project-errors"
 
-export class NotRemovableError extends Schema.TaggedErrorClass<NotRemovableError>()("Project.NotRemovableError", {
-  projectID: ProjectV2.ID,
-}) {}
+export { NotRemovableError } from "./project-errors"
 
 export interface Interface {
-  readonly remove: (projectID: ProjectV2.ID) => Effect.Effect<void, Project.NotFoundError | NotRemovableError>
+  readonly remove: (
+    projectID: ProjectV2.ID,
+  ) => Effect.Effect<void, Project.NotFoundError | NotRemovableError | ProjectDeletingError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ProjectRemoval") {}
@@ -48,6 +49,8 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const session = yield* Session.Service
     const workspace = yield* Workspace.Service
+    const coordinator = yield* ProjectDeletionCoordinator.Service
+    const scope = yield* Scope.Scope
 
     const git = Effect.fnUntraced(
       function* (args: string[], cwd: string) {
@@ -163,7 +166,6 @@ const layer = Layer.effect(
     const purgeScoped = Effect.fn("ProjectRemoval.purgeScoped")(function* (
       projectID: ProjectV2.ID,
       info: Project.Info,
-      ctx: InstanceContext,
     ) {
       // Collect everything owned by the project before any deletion.
       const sessions = yield* db
@@ -212,39 +214,11 @@ const layer = Layer.effect(
         ]),
       ]
 
-      const shareIDs =
-        ids.length === 0
-          ? []
-          : (
-              yield* db
-                .select({ session_id: SessionShareTable.session_id })
-                .from(SessionShareTable)
-                .where(inArray(SessionShareTable.session_id, ids))
-                .all()
-                .pipe(Effect.orDie)
-            ).map((entry) => SessionID.make(entry.session_id))
-
       const workspaceIDs = (
         yield* db.select({ id: WorkspaceTable.id }).from(WorkspaceTable).where(eq(WorkspaceTable.project_id, projectID)).all().pipe(Effect.orDie)
       ).map((entry) => entry.id)
 
-      // 1. Remote shares must die while state is intact; local rows would cascade
-      // away leaving shares publicly reachable on opencode.ai. Retries absorb
-      // transient network failures so a public share is not orphaned permanently.
-      yield* Effect.forEach(
-        shareIDs,
-        (id) =>
-          shareNext.remove(id).pipe(
-            Effect.provideService(InstanceRef, ctx),
-            Effect.retry({ times: 2, schedule: Schedule.spaced("200 millis") }),
-            Effect.catchCause((cause) =>
-              Effect.logWarning("share removal failed during project delete", { projectID, cause }),
-            ),
-          ),
-        { discard: true },
-      )
-
-      // 2. Workspaces stop sync fibers, dispose adapters, remove their sessions.
+      // Workspaces stop sync fibers, dispose adapters, remove their sessions.
       yield* Effect.forEach(
         workspaceIDs,
         (id) =>
@@ -300,28 +274,52 @@ const layer = Layer.effect(
         discard: true,
       })
 
-      // 8. Published LAST so clients react to completed state.
-      yield* emitDeleted(info.id)
     })
 
-    const purge = Effect.fn("ProjectRemoval.purge")(function* (projectID: ProjectV2.ID) {
-      // Idempotent re-entry guard: a concurrent purge has already tombstoned the project.
-      if (Project.isProjectDeleting(projectID)) return yield* Effect.void
+    const revokeShares = Effect.fn("ProjectRemoval.revokeShares")(function* (projectID: ProjectV2.ID) {
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       if (!row) return yield* new Project.NotFoundError({ projectID })
       const info = Project.fromRow(row)
-
-      // Boot or reuse an instance for the root BEFORE tombstoning so share removal
-      // runs with instance context while everything still exists.
       const ctx = yield* instanceStore.load({ directory: info.worktree })
-
-      const release = Project.markProjectDeleting(projectID)
-      return yield* purgeScoped(projectID, info, ctx).pipe(Effect.ensuring(Effect.sync(release)))
+      const ids = (
+        yield* db
+          .select({ id: SessionShareTable.session_id })
+          .from(SessionShareTable)
+          .innerJoin(SessionTable, eq(SessionTable.id, SessionShareTable.session_id))
+          .where(eq(SessionTable.project_id, projectID))
+          .all()
+          .pipe(Effect.orDie)
+      ).map((entry) => SessionID.make(entry.id))
+      yield* Effect.forEach(
+        ids,
+        (id) =>
+          shareNext.remove(id).pipe(
+            Effect.provideService(InstanceRef, ctx),
+            Effect.retry({ times: 2, schedule: Schedule.spaced("200 millis") }),
+          ),
+        { discard: true },
+      )
     })
 
+    const cleanup = Effect.fn("ProjectRemoval.cleanup")(function* (projectID: ProjectV2.ID) {
+      const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
+      if (!row) {
+        yield* rmPath(path.join(Global.Path.data, "snapshot", projectID))
+        return
+      }
+      const info = Project.fromRow(row)
+      yield* purgeScoped(projectID, info)
+    })
+
+    coordinator.install({ revokeShares, cleanup, publish: emitDeleted })
+    yield* coordinator.recover().pipe(Effect.forkIn(scope))
+
     const remove = Effect.fn("ProjectRemoval.remove")(function* (projectID: ProjectV2.ID) {
-      if (projectID === ProjectV2.ID.global) return yield* new NotRemovableError({ projectID })
-      yield* purge(projectID)
+      const owner = yield* coordinator.begin(projectID)
+      if (owner === "in_progress") return yield* coordinator.assertWritable(projectID)
+      const outcome = yield* coordinator.execute(projectID)
+      if (outcome.status === "completed") return
+      return yield* new ProjectDeletingError({ projectID, phase: outcome.phase })
     })
 
     return Service.of({ remove })
@@ -342,6 +340,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     Session.node,
     Workspace.node,
+    ProjectDeletionCoordinator.node,
   ],
 })
 

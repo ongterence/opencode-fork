@@ -34,6 +34,7 @@ import { InstanceStore } from "@/project/instance-store"
 import { WorkspaceAdapterRuntime } from "./workspace-adapter-runtime"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import { WorkspaceEvent } from "@opencode-ai/schema/workspace-event"
+import { ProjectDeletionCoordinator } from "@/project/deletion-coordinator"
 
 export const Info = Schema.Struct({
   ...WorkspaceInfoSchema.fields,
@@ -162,6 +163,7 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const fs = yield* FSUtil.Service
     const { db } = yield* Database.Service
+    const deletion = yield* ProjectDeletionCoordinator.Service
     const connections = new Map<WorkspaceV2.ID, ConnectionStatus>()
     const syncFibers = yield* FiberMap.make<WorkspaceV2.ID, void, SyncLoopError>()
 
@@ -438,6 +440,11 @@ const layer = Layer.effect(
       }
     })
 
+    const stopSync = Effect.fn("Workspace.stopSync")(function* (id: WorkspaceV2.ID) {
+      yield* FiberMap.remove(syncFibers, id)
+      connections.delete(id)
+    })
+
     const startSync = Effect.fn("Workspace.startSync")(function* (space: Info) {
       if (!flags.experimentalWorkspaces) return
 
@@ -464,6 +471,9 @@ const layer = Layer.effect(
       if (exists && connections.get(space.id)?.status !== "error") return
 
       setStatus(space.id, "disconnected")
+      const release = yield* deletion
+        .lease(space.projectID, `workspace:${space.id}`, () => stopSync(space.id))
+        .pipe(Effect.orDie)
 
       yield* FiberMap.run(
         syncFibers,
@@ -480,16 +490,13 @@ const layer = Layer.effect(
               })
             }),
           ),
+          Effect.ensuring(release),
         ),
       )
     })
 
-    const stopSync = Effect.fn("Workspace.stopSync")(function* (id: WorkspaceV2.ID) {
-      yield* FiberMap.remove(syncFibers, id)
-      connections.delete(id)
-    })
-
     const create = Effect.fn("Workspace.create")(function* (input: CreateInput) {
+      yield* deletion.assertWritable(input.projectID).pipe(Effect.orDie)
       const id = WorkspaceV2.ID.ascending(input.id)
       const adapter = getAdapter(input.projectID, input.type)
       const config = yield* WorkspaceAdapterRuntime.configure(adapter, {
@@ -511,6 +518,7 @@ const layer = Layer.effect(
         timeUsed: Date.now(),
       }
 
+      yield* deletion.assertWritable(input.projectID).pipe(Effect.orDie)
       yield* db
         .insert(WorkspaceTable)
         .values({
@@ -725,6 +733,7 @@ const layer = Layer.effect(
     })
 
     const syncList = Effect.fn("Workspace.syncList")(function* (project: Project.Info) {
+      yield* deletion.assertWritable(project.id).pipe(Effect.orDie)
       const names = new Set((yield* list(project)).map((workspace) => workspace.name))
       const discovered = yield* Effect.forEach(
         registeredAdapters(project.id),
@@ -755,6 +764,7 @@ const layer = Layer.effect(
               timeUsed: Date.now(),
             }
 
+            yield* deletion.assertWritable(project.id).pipe(Effect.orDie)
             yield* db
               .insert(WorkspaceTable)
               .values({
@@ -851,6 +861,7 @@ const layer = Layer.effect(
     })
 
     const startWorkspaceSyncing = Effect.fn("Workspace.startWorkspaceSyncing")(function* (projectID: ProjectV2.ID) {
+      yield* deletion.assertWritable(projectID).pipe(Effect.orDie)
       const rows = yield* db
         .selectDistinct({ workspace: WorkspaceTable })
         .from(WorkspaceTable)
@@ -958,6 +969,7 @@ export const node = LayerNode.make({
     RuntimeFlags.node,
     FSUtil.node,
     Database.node,
+    ProjectDeletionCoordinator.node,
   ],
 })
 

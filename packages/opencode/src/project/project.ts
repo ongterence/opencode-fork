@@ -22,6 +22,10 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Project } from "@opencode-ai/schema/project"
+import { ProjectDeletionCoordinator } from "./deletion-coordinator"
+import { NotFoundError } from "./project-errors"
+
+export { NotFoundError } from "./project-errors"
 
 export const Info = Project.Info
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
@@ -73,24 +77,6 @@ export const UpdatePayload = Schema.Struct({
 }).annotate({ identifier: "ProjectUpdateInput" })
 export type UpdatePayload = Types.DeepMutable<Schema.Schema.Type<typeof UpdatePayload>>
 
-export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Project.NotFoundError", {
-  projectID: ProjectV2.ID,
-}) {}
-
-// Process-global tombstones for projects currently being removed. fromDirectory
-// checks this set so requests racing a removal cannot resurrect or re-upsert the
-// doomed project row mid-purge.
-const deleting = new Set<string>()
-
-export function markProjectDeleting(id: string) {
-  deleting.add(id)
-  return () => deleting.delete(id)
-}
-
-export function isProjectDeleting(id: string) {
-  return deleting.has(id)
-}
-
 // ---------------------------------------------------------------------------
 // Effect service
 // ---------------------------------------------------------------------------
@@ -127,6 +113,7 @@ const layer = Layer.effect(
     const projectDirectories = yield* ProjectDirectories.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const deletion = yield* ProjectDeletionCoordinator.Service
     const { db } = yield* Database.Service
 
     const git = Effect.fnUntraced(
@@ -165,6 +152,8 @@ const layer = Layer.effect(
       if (!oldID) return
       if (oldID === ProjectV2.ID.global) return
       if (oldID === newID) return
+      yield* deletion.assertWritable(oldID).pipe(Effect.orDie)
+      yield* deletion.assertWritable(newID).pipe(Effect.orDie)
 
       yield* db
         .transaction(
@@ -233,7 +222,7 @@ const layer = Layer.effect(
 
       // Phase 2: upsert
       const projectID = ProjectV2.ID.make(data.id)
-      if (isProjectDeleting(projectID)) return yield* new NotFoundError({ projectID }).pipe(Effect.orDie)
+      yield* deletion.assertWritable(projectID).pipe(Effect.orDie)
       yield* migrateProjectId(data.previous ? ProjectV2.ID.make(data.previous) : undefined, projectID)
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       const existing = row
@@ -270,9 +259,8 @@ const layer = Layer.effect(
         { concurrency: "unbounded" },
       ).pipe(Effect.map((arr) => arr.filter((x): x is string => x !== undefined)))
 
-      // Re-check after async resolution: a purge may have tombstoned the project
-      // between the first check and this upsert.
-      if (isProjectDeleting(projectID)) return yield* new NotFoundError({ projectID }).pipe(Effect.orDie)
+      // Re-check after async resolution so deletion owns the final commit boundary.
+      yield* deletion.assertWritable(projectID).pipe(Effect.orDie)
       yield* db
         .insert(ProjectTable)
         .values({
@@ -362,6 +350,7 @@ const layer = Layer.effect(
     })
 
     const update = Effect.fn("Project.update")(function* (input: UpdateInput) {
+      yield* deletion.assertWritable(input.projectID).pipe(Effect.orDie)
       const result = yield* db
         .update(ProjectTable)
         .set({
@@ -394,6 +383,7 @@ const layer = Layer.effect(
     })
 
     const setInitialized = Effect.fn("Project.setInitialized")(function* (id: ProjectV2.ID) {
+      yield* deletion.assertWritable(id).pipe(Effect.orDie)
       yield* db
         .update(ProjectTable)
         .set({ time_initialized: Date.now() })
@@ -434,6 +424,7 @@ const layer = Layer.effect(
     })
 
     const addSandbox = Effect.fn("Project.addSandbox")(function* (id: ProjectV2.ID, directory: string) {
+      yield* deletion.assertWritable(id).pipe(Effect.orDie)
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get().pipe(Effect.orDie)
       if (!row) throw new Error(`Project not found: ${id}`)
       const sandbox = AbsolutePath.make(directory)
@@ -451,6 +442,7 @@ const layer = Layer.effect(
     })
 
     const removeSandbox = Effect.fn("Project.removeSandbox")(function* (id: ProjectV2.ID, directory: string) {
+      yield* deletion.assertWritable(id).pipe(Effect.orDie)
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get().pipe(Effect.orDie)
       if (!row) throw new Error(`Project not found: ${id}`)
       const sandbox = AbsolutePath.make(directory)
@@ -496,6 +488,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    ProjectDeletionCoordinator.node,
   ],
 })
 
