@@ -29,6 +29,7 @@ export type DeleteOutcome =
   | { status: "completed" }
   | { status: "in_progress"; phase: DeletionPhase }
   | { status: "retryable_failure"; phase: "share_failed"; message: string }
+  | { status: "retry_not_allowed" }
 
 export class ProjectDeletingError extends Schema.TaggedErrorClass<ProjectDeletingError>()(
   "ProjectDeletingError",
@@ -366,7 +367,7 @@ export function make(options: MakeOptions = {}) {
                 { behavior: "immediate" },
               )
               .pipe(Effect.orDie)
-            if (!claimed) return "in_progress" as const
+            if (!claimed) return "retry_not_allowed" as const
             closing.add(projectID)
             owners.set(projectID, Deferred.makeUnsafe<void>())
             return "owner" as const
@@ -375,9 +376,11 @@ export function make(options: MakeOptions = {}) {
         (owner) =>
           owner === "owner"
             ? execute(projectID)
-            : phase(projectID).pipe(
-                Effect.map((current) => ({ status: "in_progress", phase: current?.phase ?? "requested" }) as const),
-              ),
+            : owner === "retry_not_allowed"
+              ? Effect.succeed({ status: "retry_not_allowed" } as const)
+              : phase(projectID).pipe(
+                  Effect.map((current) => ({ status: "in_progress", phase: current?.phase ?? "requested" }) as const),
+                ),
         (owner) => (owner === "owner" ? releaseOwner(projectID) : Effect.void),
       )
 

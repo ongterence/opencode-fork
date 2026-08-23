@@ -4,6 +4,29 @@ export type { UpdaterState } from "@opencode-ai/app/updater"
 
 export type UpdaterReadyRecord = { version: string }
 
+export type LocalServerConnection = {
+  url: string
+  username: string | null
+  password: string | null
+}
+
+export async function prepareServerShutdown(
+  connection: LocalServerConnection,
+  fetcher: typeof fetch = fetch,
+) {
+  const headers = new Headers()
+  if (connection.username !== null && connection.password !== null)
+    headers.set("authorization", `Basic ${btoa(`${connection.username}:${connection.password}`)}`)
+  const response = await fetcher(new URL("/global/project/delete/prepare-shutdown", connection.url), {
+    method: "POST",
+    headers,
+  })
+  if (response.ok) return
+  const body = (await response.json().catch(() => undefined)) as { message?: unknown } | undefined
+  const message = typeof body?.message === "string" ? body.message : `Shutdown preparation failed (${response.status})`
+  throw new Error(message)
+}
+
 export type UpdaterBackend = {
   checkForUpdates(): Promise<{ isUpdateAvailable?: boolean; updateInfo?: { version?: string } } | null | undefined>
   downloadUpdate(): Promise<unknown>
@@ -21,6 +44,7 @@ export function createUpdaterController(input: {
   currentVersion: string
   backend: UpdaterBackend
   persistence: UpdaterPersistence
+  prepareShutdown: () => Promise<void>
   stop: () => Promise<void>
   log?: (message: string, data?: object) => void
 }) {
@@ -81,7 +105,8 @@ export function createUpdaterController(input: {
       const version = state.version
       transition({ status: "installing", version })
       await input
-        .stop()
+        .prepareShutdown()
+        .then(input.stop)
         .then(() => {
           input.backend.quitAndInstall()
           transition({ status: "ready", version })

@@ -2067,6 +2067,19 @@ export type ProjectDeletionRetryableError = {
   message: string
 }
 
+export type ProjectDeletionRetryNotAllowedError = {
+  _tag: "ProjectDeletionRetryNotAllowedError"
+  projectID: string
+  code: "project_deletion_retry_not_allowed"
+  message: string
+}
+
+export type ProjectDeletionShutdownBusyError = {
+  _tag: "ProjectDeletionShutdownBusyError"
+  code: "project_deletion_shutdown_busy"
+  message: string
+}
+
 export type Model = {
   id: string
   providerID: string
@@ -7512,9 +7525,9 @@ export type GlobalProjectDeleteRetryErrors = {
    */
   404: ProjectNotFoundError
   /**
-   * ProjectDeletionInProgressError | ProjectDeletionRetryableError
+   * ProjectDeletionInProgressError | ProjectDeletionRetryableError | ProjectDeletionRetryNotAllowedError
    */
-  409: ProjectDeletionInProgressError | ProjectDeletionRetryableError
+  409: ProjectDeletionInProgressError | ProjectDeletionRetryableError | ProjectDeletionRetryNotAllowedError
 }
 
 export type GlobalProjectDeleteRetryError = GlobalProjectDeleteRetryErrors[keyof GlobalProjectDeleteRetryErrors]
@@ -7528,6 +7541,37 @@ export type GlobalProjectDeleteRetryResponses = {
 
 export type GlobalProjectDeleteRetryResponse =
   GlobalProjectDeleteRetryResponses[keyof GlobalProjectDeleteRetryResponses]
+
+export type GlobalProjectDeletePrepareShutdownData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/project/delete/prepare-shutdown"
+}
+
+export type GlobalProjectDeletePrepareShutdownErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * ProjectDeletionShutdownBusyError
+   */
+  409: ProjectDeletionShutdownBusyError
+}
+
+export type GlobalProjectDeletePrepareShutdownError =
+  GlobalProjectDeletePrepareShutdownErrors[keyof GlobalProjectDeletePrepareShutdownErrors]
+
+export type GlobalProjectDeletePrepareShutdownResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type GlobalProjectDeletePrepareShutdownResponse =
+  GlobalProjectDeletePrepareShutdownResponses[keyof GlobalProjectDeletePrepareShutdownResponses]
 
 export type EventSubscribeData = {
   body?: never

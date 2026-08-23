@@ -17,7 +17,7 @@ import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2 } from "@opencode-ai/core/event"
-import { Cause, Context, Effect, Layer, Schedule, Scope } from "effect"
+import { Cause, Context, Effect, Layer, Schedule, Schema, Scope } from "effect"
 import { existsSync } from "fs"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import * as Stream from "effect/Stream"
@@ -29,7 +29,7 @@ import { SessionID } from "@/session/schema"
 import { ShareNext } from "@/share/share-next"
 import { InstanceStore } from "./instance-store"
 import * as Project from "./project"
-import { ProjectDeletingError, ProjectDeletionCoordinator } from "./deletion-coordinator"
+import { DeletionBusyError, ProjectDeletingError, ProjectDeletionCoordinator } from "./deletion-coordinator"
 import { NotRemovableError } from "./project-errors"
 import {
   UnsafeLegacyMetadataError,
@@ -40,13 +40,26 @@ import {
 
 export { NotRemovableError } from "./project-errors"
 
+export class ProjectDeletionRetryNotAllowedError extends Schema.TaggedErrorClass<ProjectDeletionRetryNotAllowedError>()(
+  "ProjectDeletionRetryNotAllowedError",
+  { projectID: ProjectV2.ID },
+) {
+  override get message() {
+    return "Project deletion retry is only available after a share revocation failure"
+  }
+}
+
 export interface Interface {
   readonly remove: (
     projectID: ProjectV2.ID,
   ) => Effect.Effect<void, Project.NotFoundError | NotRemovableError | ProjectDeletingError>
   readonly retry: (
     projectID: ProjectV2.ID,
-  ) => Effect.Effect<void, Project.NotFoundError | NotRemovableError | ProjectDeletingError>
+  ) => Effect.Effect<
+    void,
+    Project.NotFoundError | NotRemovableError | ProjectDeletingError | ProjectDeletionRetryNotAllowedError
+  >
+  readonly prepareShutdown: () => Effect.Effect<void, DeletionBusyError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ProjectRemoval") {}
@@ -564,16 +577,20 @@ const layer = Layer.effect(
     const remove = Effect.fn("ProjectRemoval.remove")(function* (projectID: ProjectV2.ID) {
       const outcome = yield* coordinator.runOwned(projectID)
       if (outcome.status === "completed") return
+      if (outcome.status === "retry_not_allowed")
+        return yield* new ProjectDeletingError({ projectID, phase: "requested" })
       return yield* new ProjectDeletingError({ projectID, phase: outcome.phase })
     })
 
     const retry = Effect.fn("ProjectRemoval.retry")(function* (projectID: ProjectV2.ID) {
       const outcome = yield* coordinator.retry(projectID)
       if (outcome.status === "completed") return
+      if (outcome.status === "retry_not_allowed")
+        return yield* new ProjectDeletionRetryNotAllowedError({ projectID })
       return yield* new ProjectDeletingError({ projectID, phase: outcome.phase })
     })
 
-    return Service.of({ remove, retry })
+    return Service.of({ remove, retry, prepareShutdown: coordinator.prepareShutdown })
   }),
 )
 

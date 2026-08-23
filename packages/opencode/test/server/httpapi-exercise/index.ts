@@ -133,6 +133,11 @@ const scenarios: Scenario[] = [
       path: route("/global/project/{projectID}/delete/retry", { projectID: ctx.state.id }),
     }))
     .status(409, undefined, "status"),
+  http.protected
+    .post("/global/project/delete/prepare-shutdown", "global.project.delete.prepareShutdown")
+    .global()
+    .mutating()
+    .status(204, undefined, "status"),
   http.protected.get("/path", "path.get").json(200, (body, ctx) => {
     object(body)
     check(body.directory === ctx.directory, "directory should resolve from x-opencode-directory")

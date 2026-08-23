@@ -87,6 +87,8 @@ import type {
   GlobalHealthErrors,
   GlobalHealthResponses,
   GlobalProjectDeleteErrors,
+  GlobalProjectDeletePrepareShutdownErrors,
+  GlobalProjectDeletePrepareShutdownResponses,
   GlobalProjectDeleteResponses,
   GlobalProjectDeleteRetryErrors,
   GlobalProjectDeleteRetryResponses,
@@ -1341,6 +1343,19 @@ export class Delete extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  /**
+   * Prepare project deletion shutdown
+   *
+   * Stop accepting project deletions and wait for active deletion owners to reach a durable boundary.
+   */
+  public prepareShutdown<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).post<
+      GlobalProjectDeletePrepareShutdownResponses,
+      GlobalProjectDeletePrepareShutdownErrors,
+      ThrowOnError
+    >({ url: "/global/project/delete/prepare-shutdown", ...options })
   }
 }
 

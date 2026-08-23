@@ -13,7 +13,9 @@ import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
 import {
   ProjectDeletionInProgressError,
+  ProjectDeletionRetryNotAllowedError,
   ProjectDeletionRetryableError,
+  ProjectDeletionShutdownBusyError,
   ProjectNotFoundError,
   ProjectNotRemovableError,
 } from "../errors"
@@ -143,6 +145,18 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       )
     })
 
+    const projectDeletePrepareShutdown = Effect.fn("GlobalHttpApi.projectDeletePrepareShutdown")(function* () {
+      yield* removal.prepareShutdown().pipe(
+        Effect.mapError(
+          (error) =>
+            new ProjectDeletionShutdownBusyError({
+              code: "project_deletion_shutdown_busy",
+              message: error.message,
+            }),
+        ),
+      )
+    })
+
     const projectDeleteRetry = Effect.fn("GlobalHttpApi.projectDeleteRetry")(function* (ctx) {
       yield* removal.retry(ctx.params.projectID).pipe(
         Effect.catchTags({
@@ -156,6 +170,14 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
               }),
             ),
           ProjectDeletingError: projectDeletionFailure,
+          ProjectDeletionRetryNotAllowedError: (error) =>
+            Effect.fail(
+              new ProjectDeletionRetryNotAllowedError({
+                projectID: error.projectID,
+                code: "project_deletion_retry_not_allowed",
+                message: error.message,
+              }),
+            ),
         }),
       )
     })
@@ -219,6 +241,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handle("dispose", dispose)
       .handle("projectDelete", projectDelete)
       .handle("projectDeleteRetry", projectDeleteRetry)
+      .handle("projectDeletePrepareShutdown", projectDeletePrepareShutdown)
       .handleRaw("upgrade", upgradeRaw)
   }),
 )

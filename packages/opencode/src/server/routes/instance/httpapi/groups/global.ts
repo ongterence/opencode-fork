@@ -9,7 +9,9 @@ import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import {
   ProjectDeletionInProgressError,
+  ProjectDeletionRetryNotAllowedError,
   ProjectDeletionRetryableError,
+  ProjectDeletionShutdownBusyError,
   ProjectNotFoundError,
   ProjectNotRemovableError,
 } from "../errors"
@@ -77,6 +79,7 @@ export const GlobalPaths = {
   upgrade: "/global/upgrade",
   projectDelete: "/global/project/:projectID",
   projectDeleteRetry: "/global/project/:projectID/delete/retry",
+  projectDeletePrepareShutdown: "/global/project/delete/prepare-shutdown",
 } as const
 
 export const GlobalApi = HttpApi.make("global").add(
@@ -155,12 +158,28 @@ export const GlobalApi = HttpApi.make("global").add(
       HttpApiEndpoint.post("projectDeleteRetry", GlobalPaths.projectDeleteRetry, {
         params: { projectID: ProjectV2.ID },
         success: HttpApiSchema.NoContent,
-        error: [ProjectNotFoundError, ProjectNotRemovableError, ProjectDeletionInProgressError, ProjectDeletionRetryableError],
+        error: [
+          ProjectNotFoundError,
+          ProjectNotRemovableError,
+          ProjectDeletionInProgressError,
+          ProjectDeletionRetryableError,
+          ProjectDeletionRetryNotAllowedError,
+        ],
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.project.delete.retry",
           summary: "Retry failed project deletion share revocation",
           description: "Retries a project deletion only after a retained remote share revocation failure.",
+        }),
+      ),
+      HttpApiEndpoint.post("projectDeletePrepareShutdown", GlobalPaths.projectDeletePrepareShutdown, {
+        success: HttpApiSchema.NoContent,
+        error: ProjectDeletionShutdownBusyError,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.project.delete.prepareShutdown",
+          summary: "Prepare project deletion shutdown",
+          description: "Stop accepting project deletions and wait for active deletion owners to reach a durable boundary.",
         }),
       ),
     )

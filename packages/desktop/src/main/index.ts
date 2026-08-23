@@ -32,6 +32,7 @@ import {
   type SidecarListener,
 } from "./server"
 import { setupAutoUpdater, showUpdaterDialog } from "./updater"
+import { prepareServerShutdown } from "./updater-controller"
 import { safeWebContentsURL } from "./window-state"
 import {
   getLastFocusedWindow,
@@ -266,7 +267,10 @@ const main = Effect.gen(function* () {
   app.setAsDefaultProtocolClient("opencode")
   registerRendererProtocol()
   setDockIcon()
-  const updater = setupAutoUpdater(stopSidecars)
+  const updater = setupAutoUpdater({
+    prepareShutdown: async () => prepareServerShutdown(await Effect.runPromise(Deferred.await(serverReady))),
+    stop: stopSidecars,
+  })
   const menuDeps = {
     trigger: (id: string) => {
       const win = getLastFocusedWindow()

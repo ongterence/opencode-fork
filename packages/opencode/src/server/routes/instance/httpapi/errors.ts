@@ -207,6 +207,25 @@ export class ProjectDeletionRetryableError extends Schema.TaggedErrorClass<Proje
   { httpApiStatus: 409 },
 ) {}
 
+export class ProjectDeletionRetryNotAllowedError extends Schema.TaggedErrorClass<ProjectDeletionRetryNotAllowedError>()(
+  "ProjectDeletionRetryNotAllowedError",
+  {
+    projectID: Schema.String,
+    code: Schema.Literal("project_deletion_retry_not_allowed"),
+    message: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {}
+
+export class ProjectDeletionShutdownBusyError extends Schema.TaggedErrorClass<ProjectDeletionShutdownBusyError>()(
+  "ProjectDeletionShutdownBusyError",
+  {
+    code: Schema.Literal("project_deletion_shutdown_busy"),
+    message: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {}
+
 export class ApiNotFoundError extends Schema.ErrorClass<ApiNotFoundError>("NotFoundError")(
   {
     name: Schema.Literal("NotFoundError"),

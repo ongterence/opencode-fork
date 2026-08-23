@@ -18,7 +18,7 @@ import {
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2 } from "@opencode-ai/core/event"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
-import { Context, Effect, Exit, Layer } from "effect"
+import { Context, Deferred, Effect, Exit, Layer } from "effect"
 import { eq, sql } from "drizzle-orm"
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import path from "path"
@@ -100,6 +100,22 @@ function unavailableShareUrl() {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
     if (!address || typeof address === "string") throw new Error("could not reserve a loopback port")
     return `http://127.0.0.1:${address.port}`
+  })
+}
+
+function listenObservedShareServer(entered: Deferred.Deferred<void>) {
+  return Effect.gen(function* () {
+    const context = yield* Layer.build(NodeHttpServer.layer(Http.createServer, { host: "127.0.0.1", port: 0 }))
+    const server = Context.get(context, HttpServer.HttpServer)
+    yield* server.serve(
+      HttpServerRequest.HttpServerRequest.use(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined)
+          return HttpServerResponse.empty({ status: 500 })
+        }),
+      ),
+    )
+    return HttpServer.formatAddress(server.address)
   })
 }
 
@@ -189,6 +205,48 @@ describe("global project delete endpoint", () => {
   )
 
   it.instance(
+    "returns a typed conflict to a concurrent delete while the owner reaches a terminal response",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const created = yield* requestInDirectory("/session", tmp.directory, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        })
+        const session = (yield* created.json) as { id: SessionID }
+        const entered = yield* Deferred.make<void>()
+        const shareServer = yield* listenObservedShareServer(entered)
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(SessionShareTable)
+          .values({ session_id: session.id, id: "shr_concurrent", secret: "sec_concurrent", url: `${shareServer}/share/concurrent` })
+          .run()
+          .pipe(Effect.orDie)
+
+        const server = yield* HttpServer.HttpServer
+        const owner = fetch(new URL(`/global/project/${project.id}`, HttpServer.formatAddress(server.address)), {
+          method: "DELETE",
+        })
+        yield* Deferred.await(entered)
+        const concurrent = yield* Effect.promise(() =>
+          fetch(new URL(`/global/project/${project.id}`, HttpServer.formatAddress(server.address)), { method: "DELETE" }),
+        )
+
+        expect(concurrent.status).toBe(409)
+        expect(yield* Effect.promise(() => concurrent.json())).toMatchObject({
+          code: "project_deletion_in_progress",
+          phase: "revoking_shares",
+        })
+        expect((yield* Effect.promise(() => owner)).status).toBe(409)
+      }),
+    { git: true },
+    { timeout: 15_000 },
+  )
+
+  it.instance(
     "returns conflict while a durable deletion is already in progress",
     () =>
       Effect.gen(function* () {
@@ -217,6 +275,27 @@ describe("global project delete endpoint", () => {
           phase: "revoking_shares",
           code: "project_deletion_in_progress",
           message: "Project deletion is in progress",
+        })
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "rejects retry unless the durable job is share_failed",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+
+        const response = yield* request(`/global/project/${project.id}/delete/retry`, { method: "POST" })
+
+        expect(response.status).toBe(409)
+        expect(yield* response.json).toEqual({
+          _tag: "ProjectDeletionRetryNotAllowedError",
+          projectID: project.id,
+          code: "project_deletion_retry_not_allowed",
+          message: "Project deletion retry is only available after a share revocation failure",
         })
       }),
     { git: true },

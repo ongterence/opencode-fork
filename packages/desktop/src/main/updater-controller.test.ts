@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import { createUpdaterController, type UpdaterBackend, type UpdaterReadyRecord } from "./updater-controller"
 
-function setup(input?: { currentVersion?: string; ready?: UpdaterReadyRecord }) {
+function setup(input?: {
+  currentVersion?: string
+  ready?: UpdaterReadyRecord
+  prepareShutdown?: () => Promise<void>
+}) {
   const calls: string[] = []
   const backend: UpdaterBackend = {
     async checkForUpdates() {
@@ -29,6 +33,7 @@ function setup(input?: { currentVersion?: string; ready?: UpdaterReadyRecord }) 
         ready = undefined
       },
     },
+    prepareShutdown: input?.prepareShutdown ?? (async () => calls.push("prepare")),
     stop: async () => {
       calls.push("stop")
     },
@@ -82,30 +87,39 @@ describe("updater controller", () => {
 
     await app.controller.install()
 
-    expect(app.calls).toEqual(["check", "download", "stop", "install"])
+    expect(app.calls).toEqual(["check", "download", "prepare", "stop", "install"])
     expect(app.controller.getState()).toEqual({ status: "ready", version: "2.0.0" })
   })
 
-  test("returns to ready when installation cannot start", async () => {
-    const app = setup()
+  test("waits for the deletion shutdown boundary before stopping or installing", async () => {
+    let resolve!: () => void
+    const boundary = new Promise<void>((done) => {
+      resolve = done
+    })
+    const app = setup({ prepareShutdown: () => boundary })
     await app.controller.start()
 
-    const failed = createUpdaterController({
-      enabled: true,
-      currentVersion: "1.0.0",
-      backend: {
-        checkForUpdates: async () => ({ isUpdateAvailable: true, updateInfo: { version: "2.0.0" } }),
-        downloadUpdate: async () => {},
-        quitAndInstall() {},
-      },
-      persistence: { get: () => undefined, set() {}, clear() {} },
-      stop: async () => {
-        throw new Error("stop failed")
+    const installing = app.controller.install()
+    await Promise.resolve()
+    expect(app.calls).toEqual(["check", "download"])
+
+    resolve()
+    await installing
+
+    expect(app.calls).toEqual(["check", "download", "stop", "install"])
+  })
+
+  test("keeps the installer ready and sidecars running when shutdown preparation fails", async () => {
+    const app = setup({
+      prepareShutdown: async () => {
+        throw new Error("Project deletion could not reach a durable shutdown boundary")
       },
     })
-    await failed.start()
+    await app.controller.start()
 
-    await expect(failed.install()).rejects.toThrow("stop failed")
-    expect(failed.getState()).toEqual({ status: "ready", version: "2.0.0" })
+    await expect(app.controller.install()).rejects.toThrow("durable shutdown boundary")
+    expect(app.calls).toEqual(["check", "download"])
+    expect(app.getReady()).toEqual({ version: "2.0.0" })
+    expect(app.controller.getState()).toEqual({ status: "ready", version: "2.0.0" })
   })
 })
