@@ -41,6 +41,7 @@ export interface DeletionActions {
 export interface Interface {
   readonly begin: (projectID: ProjectV2.ID) => Effect.Effect<"owner" | "in_progress", NotFoundError | NotRemovableError>
   readonly execute: (projectID: ProjectV2.ID) => Effect.Effect<DeleteOutcome>
+  readonly runOwned: (projectID: ProjectV2.ID) => Effect.Effect<DeleteOutcome, NotFoundError | NotRemovableError>
   readonly assertWritable: (projectID: ProjectV2.ID) => Effect.Effect<void, ProjectDeletingError>
   readonly withMutation: <A, E, R>(
     projectID: ProjectV2.ID,
@@ -211,7 +212,7 @@ export function make(options: MakeOptions = {}) {
     const deliver = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
       const currentActions = actions
       if (!currentActions) return
-      yield* db
+      const job = yield* db
         .transaction(
           (tx) =>
             Effect.gen(function* () {
@@ -223,7 +224,7 @@ export function make(options: MakeOptions = {}) {
                 .from(ProjectDeletionJobTable)
                 .where(eq(ProjectDeletionJobTable.project_id, projectID))
                 .get()
-              if (!job || job.deliveredAt !== null) return
+              if (!job || job.deliveredAt !== null) return job
               const eventID = EventV2.ID.make(job.eventID ?? EventV2.ID.create())
               if (!job.eventID)
                 yield* tx
@@ -231,17 +232,25 @@ export function make(options: MakeOptions = {}) {
                   .set({ event_id: eventID })
                   .where(eq(ProjectDeletionJobTable.project_id, projectID))
                   .run()
-              yield* currentActions.publish(projectID, eventID)
-              yield* tx
-                .update(ProjectDeletionJobTable)
-                .set({ event_delivered_at: Date.now(), updated_at: Date.now() })
-                .where(eq(ProjectDeletionJobTable.project_id, projectID))
-                .run()
+              return { ...job, eventID }
             }),
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie)
+      if (!job || job.deliveredAt !== null || !job.eventID) return
+      yield* currentActions.publish(projectID, EventV2.ID.make(job.eventID))
       if (options.afterPublish) yield* options.afterPublish()
+      yield* db
+        .transaction(
+          (tx) =>
+            tx
+              .update(ProjectDeletionJobTable)
+              .set({ event_delivered_at: Date.now(), updated_at: Date.now() })
+              .where(eq(ProjectDeletionJobTable.project_id, projectID))
+              .run(),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
     })
 
     const run = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
@@ -300,115 +309,134 @@ export function make(options: MakeOptions = {}) {
 
     const execute: Interface["execute"] = (projectID) => run(projectID).pipe(Effect.ensuring(releaseOwner(projectID)))
 
-    const begin: Interface["begin"] = (projectID) => {
-      if (owners.has(projectID) || closing.has(projectID)) return Effect.succeed("in_progress" as const)
-      closing.add(projectID)
-      owners.set(projectID, Deferred.makeUnsafe<void>())
-      return gates
-        .withLock(projectID)(
-          db.transaction(
-            (tx) =>
-              Effect.gen(function* () {
-                if (projectID === ProjectV2.ID.global) return yield* new NotRemovableError({ projectID })
-                const existing = yield* tx
-                  .select({ phase: ProjectDeletionJobTable.phase })
-                  .from(ProjectDeletionJobTable)
-                  .where(eq(ProjectDeletionJobTable.project_id, projectID))
-                  .get()
-                if (existing) return "in_progress" as const
-                const project = yield* tx.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get()
-                if (!project) return yield* new NotFoundError({ projectID })
-                const now = Date.now()
-                yield* tx
-                  .insert(ProjectDeletionJobTable)
-                  .values({
-                    project_id: projectID,
-                    phase: "requested",
-                    attempt: 0,
-                    last_error: null,
-                    event_id: EventV2.ID.create(),
-                    event_delivered_at: null,
-                    created_at: now,
-                    updated_at: now,
-                  })
-                  .run()
-                const shares = yield* tx
-                  .select({
-                    sessionID: SessionShareTable.session_id,
-                    shareID: SessionShareTable.id,
-                    secret: SessionShareTable.secret,
-                    baseUrl: SessionShareTable.url,
-                  })
-                  .from(SessionShareTable)
-                  .innerJoin(SessionTable, eq(SessionTable.id, SessionShareTable.session_id))
-                  .where(eq(SessionTable.project_id, projectID))
-                  .all()
-                if (shares.length > 0)
-                  yield* tx
-                    .insert(ProjectDeletionShareTable)
-                    .values(
-                      shares.map((share) => ({
+    const runOwned: Interface["runOwned"] = (projectID) =>
+      Effect.acquireUseRelease(
+        begin(projectID),
+        (owner) =>
+          owner === "owner"
+            ? execute(projectID)
+            : phase(projectID).pipe(
+                Effect.map((current) => ({ status: "in_progress", phase: current?.phase ?? "requested" }) as const),
+              ),
+        (owner) => (owner === "owner" ? releaseOwner(projectID) : Effect.void),
+      )
+
+    const begin: Interface["begin"] = (projectID) =>
+      Effect.suspend(() => {
+        let installed = false
+        return gates
+          .withLock(projectID)(
+            Effect.gen(function* () {
+              if (admissionClosed || owners.has(projectID) || closing.has(projectID)) return "in_progress" as const
+              closing.add(projectID)
+              owners.set(projectID, Deferred.makeUnsafe<void>())
+              installed = true
+              return yield* db.transaction(
+                (tx) =>
+                  Effect.gen(function* () {
+                    if (projectID === ProjectV2.ID.global) return yield* new NotRemovableError({ projectID })
+                    const existing = yield* tx
+                      .select({ phase: ProjectDeletionJobTable.phase })
+                      .from(ProjectDeletionJobTable)
+                      .where(eq(ProjectDeletionJobTable.project_id, projectID))
+                      .get()
+                    if (existing) return "in_progress" as const
+                    const project = yield* tx.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get()
+                    if (!project) return yield* new NotFoundError({ projectID })
+                    const now = Date.now()
+                    yield* tx
+                      .insert(ProjectDeletionJobTable)
+                      .values({
                         project_id: projectID,
-                        session_id: share.sessionID,
-                        share_id: share.shareID,
-                        secret: share.secret,
-                        base_url: share.baseUrl,
-                        status: "pending" as const,
+                        phase: "requested",
                         attempt: 0,
                         last_error: null,
+                        event_id: EventV2.ID.create(),
+                        event_delivered_at: null,
                         created_at: now,
                         updated_at: now,
-                      })),
-                    )
-                    .run()
-                const workspaces = yield* tx
-                  .select({ path: WorkspaceTable.directory, branch: WorkspaceTable.branch })
-                  .from(WorkspaceTable)
-                  .where(eq(WorkspaceTable.project_id, projectID))
-                  .all()
-                const paths = [...project.sandboxes.map((path) => ({ path, branch: null })), ...workspaces]
-                  .filter((item): item is { path: string; branch: string | null } => item.path !== null)
-                  .filter((item, index, all) => all.findIndex((other) => other.path === item.path) === index)
-                if (paths.length > 0)
-                  yield* tx
-                    .insert(ProjectDeletionWorktreeTable)
-                    .values(
-                      paths.map((item) => ({
-                        project_id: projectID,
-                        canonical_path: item.path,
-                        branch: item.branch,
-                        attempt: 0,
-                        last_error: null,
-                        created_at: now,
-                        updated_at: now,
-                      })),
-                    )
-                    .run()
-                return "owner" as const
-              }),
-            { behavior: "immediate" },
-          ),
-        )
-        .pipe(
-          Effect.onExit((exit) =>
-            Exit.isSuccess(exit) && exit.value === "owner" ? Effect.void : releaseOwner(projectID),
-          ),
-          Effect.catchTag("SqlError", Effect.die),
-        ) as Effect.Effect<"owner" | "in_progress", NotFoundError | NotRemovableError>
-    }
+                      })
+                      .run()
+                    const shares = yield* tx
+                      .select({
+                        sessionID: SessionShareTable.session_id,
+                        shareID: SessionShareTable.id,
+                        secret: SessionShareTable.secret,
+                        baseUrl: SessionShareTable.url,
+                      })
+                      .from(SessionShareTable)
+                      .innerJoin(SessionTable, eq(SessionTable.id, SessionShareTable.session_id))
+                      .where(eq(SessionTable.project_id, projectID))
+                      .all()
+                    if (shares.length > 0)
+                      yield* tx
+                        .insert(ProjectDeletionShareTable)
+                        .values(
+                          shares.map((share) => ({
+                            project_id: projectID,
+                            session_id: share.sessionID,
+                            share_id: share.shareID,
+                            secret: share.secret,
+                            base_url: share.baseUrl,
+                            status: "pending" as const,
+                            attempt: 0,
+                            last_error: null,
+                            created_at: now,
+                            updated_at: now,
+                          })),
+                        )
+                        .run()
+                    const workspaces = yield* tx
+                      .select({ path: WorkspaceTable.directory, branch: WorkspaceTable.branch })
+                      .from(WorkspaceTable)
+                      .where(eq(WorkspaceTable.project_id, projectID))
+                      .all()
+                    const paths = [...project.sandboxes.map((path) => ({ path, branch: null })), ...workspaces]
+                      .filter((item): item is { path: string; branch: string | null } => item.path !== null)
+                      .filter((item, index, all) => all.findIndex((other) => other.path === item.path) === index)
+                    if (paths.length > 0)
+                      yield* tx
+                        .insert(ProjectDeletionWorktreeTable)
+                        .values(
+                          paths.map((item) => ({
+                            project_id: projectID,
+                            canonical_path: item.path,
+                            branch: item.branch,
+                            attempt: 0,
+                            last_error: null,
+                            created_at: now,
+                            updated_at: now,
+                          })),
+                        )
+                        .run()
+                    return "owner" as const
+                  }),
+                { behavior: "immediate" },
+              )
+            }),
+          )
+          .pipe(
+            Effect.onExit((exit) =>
+              !installed || (Exit.isSuccess(exit) && exit.value === "owner") ? Effect.void : releaseOwner(projectID),
+            ),
+            Effect.catchTag("SqlError", Effect.die),
+          ) as Effect.Effect<"owner" | "in_progress", NotFoundError | NotRemovableError>
+      })
 
     const recover: Interface["recover"] = Effect.fn("ProjectDeletionCoordinator.recover")(function* () {
-      if (!actions) return
+      if (!actions || admissionClosed) return
       const jobs = yield* db
         .select({ projectID: ProjectDeletionJobTable.project_id, phase: ProjectDeletionJobTable.phase })
         .from(ProjectDeletionJobTable)
         .all()
         .pipe(Effect.orDie)
       for (const job of jobs) {
+        if (admissionClosed) return
         if (job.phase === "share_failed") continue
         const projectID = ProjectV2.ID.make(job.projectID)
         for (let attempt = 0; attempt < (options.recoveryAttempts ?? 3); attempt++) {
           if (owners.has(projectID)) break
+          if (admissionClosed) return
           closing.add(projectID)
           owners.set(projectID, Deferred.makeUnsafe<void>())
           const outcome = yield* execute(projectID)
@@ -437,6 +465,7 @@ export function make(options: MakeOptions = {}) {
     return Service.of({
       begin,
       execute,
+      runOwned,
       assertWritable,
       withMutation,
       withLease,

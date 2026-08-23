@@ -1,15 +1,19 @@
 import { afterEach, describe, expect } from "bun:test"
+import { $ } from "bun"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
-import { ProjectDeletionJobTable } from "@opencode-ai/core/project/deletion.sql"
+import { ProjectDeletionJobTable, ProjectDeletionWorktreeTable } from "@opencode-ai/core/project/deletion.sql"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { Effect, Layer } from "effect"
+import { eq } from "drizzle-orm"
 import path from "path"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
 import { Snapshot } from "../../src/snapshot"
+import { ProjectDeletionCoordinator } from "../../src/project/deletion-coordinator"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { resetDatabase } from "../fixture/db"
@@ -28,6 +32,7 @@ const testInstanceStore = AppNodeBuilder.build(InstanceStore.node, [[InstanceSto
 const it = testEffect(
   Layer.mergeAll(
     AppNodeBuilder.build(LayerNode.group([FSUtil.node, Snapshot.node, Database.node])),
+    AppNodeBuilder.build(ProjectDeletionCoordinator.node),
     testInstanceStore,
     httpApiLayer,
   ),
@@ -85,14 +90,39 @@ describe("global project delete endpoint", () => {
         expect(yield* fs.exists(path.join(tmp.directory, "keep.txt"))).toBe(true)
         // Instance disposal runs as part of the purge.
         expect(events.seen.some((event) => event.payload.type === "server.instance.disposed")).toBe(true)
+        const deleted = events.seen.find(
+          (event) =>
+            event.directory === "global" &&
+            event.payload.type === "project.deleted" &&
+            (event.payload.properties as { id?: string }).id === target.id,
+        )
+        expect(deleted).toBeDefined()
+        const eventID = deleted?.payload.id
+        if (!eventID) throw new Error("durable project deletion event did not include an id")
         expect(
-          events.seen.some(
-            (event) =>
-              event.directory === "global" &&
-              event.payload.type === "project.deleted" &&
-              (event.payload.properties as { id?: string }).id === target.id,
-          ),
-        ).toBe(true)
+          yield* db.select().from(EventTable).where(eq(EventTable.id, eventID)).get().pipe(Effect.orDie),
+        ).toBeDefined()
+
+        // Simulate a crash after EventV2 committed and bridged the event but
+        // before the deletion journal recorded delivery. Recovery must use the
+        // stable event id and must not bridge a second local notification.
+        yield* db
+          .insert(ProjectDeletionJobTable)
+          .values({
+            project_id: target.id,
+            phase: "cleanup_complete",
+            attempt: 0,
+            last_error: null,
+            event_id: eventID,
+            event_delivered_at: null,
+            created_at: 1,
+            updated_at: 1,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        const coordinator = yield* ProjectDeletionCoordinator.Service
+        yield* coordinator.recover()
+        expect(events.seen.filter((event) => event.payload.type === "project.deleted")).toHaveLength(1)
       }),
     { git: true },
   )
@@ -203,9 +233,19 @@ describe("global project delete endpoint", () => {
             body: JSON.stringify({ type: "missing", branch: null }),
           }),
           requestInDirectory(`/session/${session.id}/share`, tmp.directory, { method: "POST" }),
+          requestInDirectory(`/session/${session.id}/command`, tmp.directory, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ command: "missing", arguments: "" }),
+          }),
+          requestInDirectory(`/session/${session.id}/shell`, tmp.directory, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ agent: "build", command: "echo late" }),
+          }),
         ]
         const responses = yield* Effect.all(requests, { concurrency: "unbounded" })
-        expect(responses.map((response) => response.status)).toEqual([409, 409, 409, 409, 409, 409])
+        expect(responses.map((response) => response.status)).toEqual([409, 409, 409, 409, 409, 409, 409, 409])
         for (const response of responses) {
           const body = (yield* response.json) as { code?: string }
           expect(body.code).toBe("project_deletion_in_progress")
@@ -217,6 +257,48 @@ describe("global project delete endpoint", () => {
           .all()
           .pipe(Effect.orDie)).find((entry) => entry.id === project.id)
         expect(row?.name).not.toBe("late")
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "retries mandatory worktree cleanup from durable project metadata before terminal success",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const fs = yield* FSUtil.Service
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: string }
+        const root = path.join(Global.Path.data, "worktree", project.id)
+        const worktree = path.join(root, "retry-locked")
+        const artifact = path.join(Global.Path.data, "storage", "project", `${project.id}.json`)
+        yield* fs.ensureDir(root)
+        yield* Effect.promise(() => $`git worktree add -b deletion-retry ${worktree}`.cwd(tmp.directory).quiet())
+        yield* Effect.promise(() => $`git worktree lock ${worktree}`.cwd(tmp.directory).quiet())
+        yield* Effect.promise(() => Bun.write(artifact, "must be removed"))
+
+        const events = yield* collectGlobalEvents()
+        const first = yield* request(`/global/project/${project.id}`, { method: "DELETE" })
+        expect(first.status).toBe(409)
+        const { db } = yield* Database.Service
+        expect(
+          (yield* db.select().from(ProjectTable).all().pipe(Effect.orDie)).some((row) => row.id === project.id),
+        ).toBe(true)
+        expect(yield* fs.exists(worktree)).toBe(true)
+        expect(yield* fs.exists(artifact)).toBe(true)
+
+        yield* Effect.promise(() => $`git worktree unlock ${worktree}`.cwd(tmp.directory).quiet())
+        const coordinator = yield* ProjectDeletionCoordinator.Service
+        yield* coordinator.recover()
+
+        expect(
+          (yield* db.select().from(ProjectTable).all().pipe(Effect.orDie)).some((row) => row.id === project.id),
+        ).toBe(false)
+        expect(yield* fs.exists(root)).toBe(false)
+        expect(yield* fs.exists(artifact)).toBe(false)
+        expect(yield* db.select().from(ProjectDeletionJobTable).all().pipe(Effect.orDie)).toEqual([])
+        expect(yield* db.select().from(ProjectDeletionWorktreeTable).all().pipe(Effect.orDie)).toEqual([])
+        expect(events.seen.filter((event) => event.payload.type === "project.deleted")).toHaveLength(1)
       }),
     { git: true },
   )

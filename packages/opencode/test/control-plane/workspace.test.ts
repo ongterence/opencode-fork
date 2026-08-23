@@ -4,7 +4,7 @@ import fs from "node:fs/promises"
 import Http from "node:http"
 import path from "node:path"
 import { NodeHttpServer } from "@effect/platform-node"
-import { Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
@@ -31,6 +31,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { ProjectDeletionCoordinator } from "@/project/deletion-coordinator"
 
 const originalEnv = {
   OPENCODE_AUTH_CONTENT: process.env.OPENCODE_AUTH_CONTENT,
@@ -61,6 +62,7 @@ const workspaceLayer = (experimentalWorkspaces: boolean) =>
 
 const testServerLayer = Layer.mergeAll(
   NodeHttpServer.layer(Http.createServer, { host: "127.0.0.1", port: 0 }),
+  AppNodeBuilder.build(ProjectDeletionCoordinator.node),
   workspaceLayer(true),
 )
 const it = testEffect(testServerLayer)
@@ -523,6 +525,56 @@ describe("workspace CRUD", () => {
           "configure exploded",
         )
         expect(yield* workspace.list(instance.project)).toEqual([])
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "holds the project deletion lease until adapter creation settles",
+    () =>
+      Effect.gen(function* () {
+        const instance = yield* requireInstance
+        const workspace = yield* Workspace.Service
+        const coordinator = yield* ProjectDeletionCoordinator.Service
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const cleaned = yield* Deferred.make<void>()
+        const type = unique("create-deletion-overlap")
+        const targetDir = path.join(instance.directory, "create-deletion-overlap")
+        registerAdapter(
+          instance.project.id,
+          type,
+          recordedAdapter({
+            async create() {
+              await Effect.runPromise(Deferred.succeed(entered, undefined))
+              await Effect.runPromise(Deferred.await(release))
+              await fs.mkdir(targetDir, { recursive: true })
+            },
+            target() {
+              return { type: "local", directory: targetDir }
+            },
+          }).adapter,
+        )
+        coordinator.install({
+          revokeShares: () => Effect.void,
+          cleanup: () => Deferred.succeed(cleaned, undefined),
+          publish: () => Effect.void,
+        })
+
+        const scope = yield* Effect.scope
+        const creating = yield* workspace
+          .create({ type, branch: null, projectID: instance.project.id, extra: null })
+          .pipe(Effect.forkIn(scope))
+        yield* Deferred.await(entered)
+        expect(yield* coordinator.begin(instance.project.id)).toBe("owner")
+        const deleting = yield* coordinator.execute(instance.project.id).pipe(Effect.forkIn(scope))
+        yield* Effect.yieldNow
+        expect(yield* Deferred.isDone(cleaned)).toBe(false)
+
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(creating)
+        expect(yield* Fiber.join(deleting)).toEqual({ status: "completed" })
+        expect(yield* Deferred.isDone(cleaned)).toBe(true)
       }),
     { git: true },
   )

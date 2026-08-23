@@ -36,9 +36,11 @@ const layer = Layer.effect(
       Effect.gen(function* () {
         const ctx = yield* InstanceRef
         const workspaceID = (yield* WorkspaceRef) ?? event.location?.workspaceID
+        const global = event.metadata?.global === true
+        const project = typeof event.metadata?.project === "string" ? event.metadata.project : ctx?.project.id
         GlobalBus.emit("event", {
-          directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project.id,
+          directory: global ? "global" : (event.location?.directory ?? ctx?.directory),
+          project,
           workspace: workspaceID,
           payload: { id: event.id, type: event.type, properties: event.data },
         })

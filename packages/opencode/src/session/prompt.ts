@@ -104,7 +104,7 @@ export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | ProjectDeletingError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
-  readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
+  readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError | ProjectDeletingError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | ProjectDeletingError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
@@ -1356,14 +1356,18 @@ const layer = Layer.effect(
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
-    const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
-      "SessionPrompt.shell",
-    )(function* (input: ShellInput) {
-      const ready = yield* Latch.make()
-      return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
-    })
+    const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError | ProjectDeletingError> =
+      Effect.fn("SessionPrompt.shell")(function* (input: ShellInput) {
+        const ready = yield* Latch.make()
+        return yield* sessions.withLease(
+          input.sessionID,
+          () => state.cancel(input.sessionID),
+          state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready),
+        )
+      })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
+      yield* sessions.assertWritable(input.sessionID)
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
         command: input.command,

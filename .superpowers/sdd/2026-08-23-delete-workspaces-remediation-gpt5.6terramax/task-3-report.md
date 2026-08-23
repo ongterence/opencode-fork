@@ -231,3 +231,88 @@ The two pre-existing custom-elements declaration files remain user-owned, unmodi
 - Publication is currently a synchronous in-process `GlobalBus` delivery. The stable id plus delivered marker guarantees the tested publish-before-phase-transition recovery boundary. If publication later becomes an asynchronous external broker operation, the broker/consumer must use the stable id for idempotency or the outbox must gain an acknowledged relay; an external side effect cannot be made exactly-once by SQLite alone.
 - Workspace adapter creation runs after the workspace row's gated commit because the builtin adapter re-enters project mutation (`addSandbox`). Holding the non-reentrant project gate across that adapter call deadlocks. The row is therefore always visible to a deletion snapshot before the external adapter side effect starts, and adapter failure retains the row as the existing contract requires.
 - Task 4 still owns historical share-credential revocation semantics. Task 5 still owns the complete path inventory and final cleanup implementation. This fix only strengthens the current action boundary so a required cleanup failure cannot produce terminal success.
+
+---
+
+## Fix round 2 — retry metadata, durable EventV2 publication, and lifecycle admission
+
+### TDD red evidence
+
+The production cleanup regression was added first and exercised the real git failure path. From `packages/opencode`:
+
+```text
+$ bun test --timeout 20000 test/server/project-global-delete.test.ts -t "retries mandatory worktree cleanup"
+Expected: true
+Received: false
+0 pass
+1 fail
+2 expect() calls
+Ran 1 test across 1 file. [5.37s]
+```
+
+The test creates and locks a real git worktree, invokes the production global DELETE route, and expects the project row to remain as retry metadata after mandatory cleanup fails. The red result proved the row had already been removed. During the final lifecycle verification, a new competing-owner assertion also failed (`Expected ownerCount 1, Received 0`), exposing that a non-owning `begin()` exit could release another fiber's owner; the final implementation now releases only ownership installed by that invocation.
+
+### Implemented corrections
+
+- Moved `ProjectTable` deletion after every mandatory git worktree and OpenCode artifact removal. A failed external cleanup therefore retains immutable project metadata, retries the same production target set, and cannot turn a missing project row into false terminal success. Journal worktree rows are retained until `finish` and removed only after cleanup and publication complete.
+- Made `project.deleted` a durable EventV2 definition and registered it in the durable manifest. Production publication uses the journal's stable event id, checks the durable `EventTable` idempotency record, and routes the committed event through `EventV2Bridge` with explicit global/project metadata. The coordinator's failure hook now sits at the actual boundary after durable publication and before `event_delivered_at` is written.
+- Added a production crash-boundary test: after a real durable deletion event is committed and bridged, it recreates the `cleanup_complete` journal state with the same event id. Recovery observes the durable event and emits no second `project.deleted` notification.
+- Added `runOwned` with `Effect.acquireUseRelease`, so the release finalizer is installed atomically with deletion admission. A competing `begin`/`runOwned` no longer releases the active owner. `prepareShutdown` closes owner admission before snapshotting; `begin` rechecks closure under the keyed gate, `recover` rechecks it before every owner installation, and bounded drain still returns `DeletionBusyError` for an owner that cannot reach a durable boundary.
+- Held a unique deletion lease across workspace row insertion and the external adapter `create` promise. Adapter creation is uninterruptible inside the lease so deletion quiescence cannot proceed while the underlying JavaScript promise is still mutating external state.
+- Added session deletion admission to commands before command lookup and wrapped shell execution in the existing session/project lease with the existing session cancellation path. Command and shell service errors preserve `ProjectDeletingError`; their HttpApi declarations and handlers map it to the stable typed `409` response.
+
+### Final green verification
+
+Coordinator, production global deletion, and the complete workspace suite, from `packages/opencode`:
+
+```text
+$ bun test --timeout 30000 test/project/deletion-coordinator.test.ts test/server/project-global-delete.test.ts test/control-plane/workspace.test.ts
+51 pass
+1 skip
+0 fail
+204 expect() calls
+Ran 52 tests across 3 files. [35.90s]
+```
+
+The global mutation barrier now checks project, session-create, session-update, prompt, workspace, share, command, and shell routes and observes eight typed `409` responses. The locked-worktree recovery test proves the project row survives the first failure and that recovery removes the worktree root, project storage artifact, project row, deletion job, and deletion-worktree journal rows before one terminal event.
+
+Package-local typechecks:
+
+```text
+# packages/opencode
+$ bun run typecheck
+$ tsgo --noEmit
+
+# packages/schema
+$ bun run typecheck
+$ tsgo --noEmit
+```
+
+Relevant prompt/session/share regression batch, from `packages/opencode`:
+
+```text
+$ bun test --timeout 30000 test/session/prompt.test.ts test/session/session.test.ts test/share/share-next.test.ts test/server/httpapi-session.test.ts
+79 pass
+14 skip
+1 fail
+348 expect() calls
+Ran 94 tests across 4 files. [77.84s]
+```
+
+The one failure is `session HttpApi > validates archived timestamp values`, which expects HTTP 200 for `archived: -1` but receives 500. It is confirmed baseline-existing: the exact focused command at parent commit `ea7809cfe6` in a detached temporary worktree produced the identical `Expected: 200 / Received: 500` failure (`0 pass, 1 fail`, 9.64s). It also reproduced with this round's durable Project event schema change temporarily removed. All other relevant session, prompt, share, deletion, and workspace cases passed.
+
+### Fix-round changed files
+
+- Durable event definition and routing: `packages/schema/src/project.ts`, `packages/schema/src/durable-event-manifest.ts`, `packages/opencode/src/event-v2-bridge.ts`.
+- Coordinator and production cleanup: `packages/opencode/src/project/deletion-coordinator.ts`, `packages/opencode/src/project/removal.ts`.
+- Adjacent admission paths: `packages/opencode/src/control-plane/workspace.ts`, `packages/opencode/src/session/prompt.ts`.
+- Typed HTTP contract: `packages/opencode/src/server/routes/instance/httpapi/groups/session.ts`, `packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts`.
+- Regression coverage: `packages/opencode/test/project/deletion-coordinator.test.ts`, `packages/opencode/test/server/project-global-delete.test.ts`, `packages/opencode/test/control-plane/workspace.test.ts`.
+
+The two pre-existing custom-elements declaration files remain user-owned, unmodified, and excluded from this commit.
+
+### Necessary deviation and residual boundary
+
+- Making `Project.Event.Deleted` durable and adding it to the schema durable manifest is the only new support change outside the coordinator/admission files. It is necessary to use the repository's existing transactionally committed EventV2 outbox instead of treating volatile `GlobalBus` delivery as the durability boundary; no new database table or migration was added in this round.
+- EventV2 commit plus stable event-id suppression guarantees one durable deletion record and prevents recovery from re-bridging an already committed event. Raw in-process `GlobalBus` remains a volatile compatibility projection: a process crash after the SQLite commit but before an in-memory listener runs cannot provide exactly-once delivery to that dead process. Durable EventV2 replay is the authoritative no-loss recovery mechanism.
+- Task 4 continues to own historical share credential semantics. Task 5 continues to own the complete cleanup/path inventory rewrite; this round specifically prevents the current production cleanup from returning terminal success after a failed mandatory target.

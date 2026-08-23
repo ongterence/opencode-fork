@@ -10,12 +10,13 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventV2 } from "@opencode-ai/core/event"
 import { Context, Effect, Layer, Schedule, Scope } from "effect"
 import { existsSync } from "fs"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import * as Stream from "effect/Stream"
 import path from "path"
-import { GlobalBus } from "@/bus/global"
 import { Workspace } from "@/control-plane/workspace"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -150,14 +151,23 @@ const layer = Layer.effect(
       yield* rmPath(root)
     })
 
-    const emitDeleted = (id: string, eventID: string) =>
-      Effect.sync(() =>
-        GlobalBus.emit("event", {
-          directory: "global",
-          project: id,
-          payload: { id: eventID, type: Project.Event.Deleted.type, properties: { id } },
-        }),
+    const emitDeleted = Effect.fn("ProjectRemoval.emitDeleted")(function* (id: ProjectV2.ID, eventID: EventV2.ID) {
+      const existing = yield* db
+        .select({ id: EventTable.id })
+        .from(EventTable)
+        .where(eq(EventTable.id, eventID))
+        .get()
+        .pipe(Effect.orDie)
+      if (existing) return
+      yield* events.publish(
+        Project.Event.Deleted,
+        { id },
+        {
+          id: eventID,
+          metadata: { global: true, project: id },
+        },
       )
+    })
 
     const purgeScoped = Effect.fn("ProjectRemoval.purgeScoped")(function* (
       projectID: ProjectV2.ID,
@@ -229,18 +239,18 @@ const layer = Layer.effect(
         { discard: true },
       )
 
-      // 4. FK cascades sweep project_directory, permission, workspace, stragglers.
-      yield* db.delete(ProjectTable).where(eq(ProjectTable.id, projectID)).run().pipe(Effect.orDie)
-
-      // 5. Event aggregates have no FK; no-op where Session.remove already cleaned.
+      // 4. Event aggregates have no FK; no-op where Session.remove already cleaned.
       yield* Effect.forEach(ids, (id) => events.remove(id).pipe(Effect.ignore), { discard: true })
 
-      // 6. Cached instances for every directory of the project.
+      // 5. Cached instances for every directory of the project.
       yield* Effect.forEach(directories, (directory) => instanceStore.disposeDirectory(directory).pipe(Effect.ignore), {
         discard: true,
       })
 
-      // 7. Artifacts under Global.Path.data only; never inside info.worktree.
+      // 6. Artifacts under Global.Path.data only; never inside info.worktree.
+      // Keep ProjectTable as immutable retry metadata until every mandatory
+      // external cleanup has completed. A failed cleanup can then reconstruct
+      // the same target set instead of mistaking a missing row for success.
       yield* removeGitWorktrees(info)
       yield* rmPath(path.join(Global.Path.data, "snapshot", info.id))
       yield* rmPath(path.join(Global.Path.data, "storage", "project", `${info.id}.json`))
@@ -262,6 +272,9 @@ const layer = Layer.effect(
       yield* Effect.forEach(legacyIDs.parts, (pid) => rmPath(path.join(Global.Path.data, "storage", "part", pid)), {
         discard: true,
       })
+
+      // 7. FK cascades sweep project_directory, permission, workspace, stragglers.
+      yield* db.delete(ProjectTable).where(eq(ProjectTable.id, projectID)).run().pipe(Effect.orDie)
     })
 
     const revokeShares = Effect.fn("ProjectRemoval.revokeShares")(function* (projectID: ProjectV2.ID) {
@@ -303,9 +316,7 @@ const layer = Layer.effect(
     yield* coordinator.recover().pipe(Effect.forkIn(scope))
 
     const remove = Effect.fn("ProjectRemoval.remove")(function* (projectID: ProjectV2.ID) {
-      const owner = yield* coordinator.begin(projectID)
-      if (owner === "in_progress") return yield* coordinator.assertWritable(projectID)
-      const outcome = yield* coordinator.execute(projectID)
+      const outcome = yield* coordinator.runOwned(projectID)
       if (outcome.status === "completed") return
       return yield* new ProjectDeletingError({ projectID, phase: outcome.phase })
     })

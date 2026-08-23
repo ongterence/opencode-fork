@@ -3,6 +3,7 @@ import { ProjectDeletionJobTable, ProjectDeletionShareTable } from "@opencode-ai
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { ProjectV2 } from "@opencode-ai/core/project"
+import { EventV2 } from "@opencode-ai/core/event"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { eq } from "drizzle-orm"
@@ -60,6 +61,8 @@ describe("project deletion coordinator", () => {
 
       expect(yield* coordinator.ownerCount()).toBe(1)
       expect(yield* coordinator.begin(projectID)).toBe("in_progress")
+      expect(yield* coordinator.runOwned(projectID)).toEqual({ status: "in_progress", phase: "revoking_shares" })
+      expect(yield* coordinator.ownerCount()).toBe(1)
       const fenced = yield* coordinator.assertWritable(projectID).pipe(Effect.flip)
       expect(fenced).toBeInstanceOf(ProjectDeletingError)
       const lateID = ProjectV2.ID.make("proj_late_mutation")
@@ -207,6 +210,25 @@ describe("project deletion coordinator", () => {
     }),
   )
 
+  it.live("installs deletion owner finalization atomically with begin", () =>
+    Effect.gen(function* () {
+      yield* seedProject()
+      const entered = yield* Deferred.make<void>()
+      const coordinator = yield* make()
+      coordinator.install({
+        revokeShares: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        cleanup: () => Effect.void,
+        publish: () => Effect.void,
+      })
+
+      const owner = yield* coordinator.runOwned(projectID).pipe(Effect.forkIn(yield* Effect.scope))
+      yield* Deferred.await(entered)
+      expect(yield* coordinator.ownerCount()).toBe(1)
+      yield* Fiber.interrupt(owner)
+      expect(yield* coordinator.ownerCount()).toBe(0)
+    }),
+  )
+
   it.live("recovers each durable phase with the correct next action", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service
@@ -346,11 +368,12 @@ describe("project deletion coordinator", () => {
     }),
   )
 
-  it.live("records event delivery before a publish-to-transition crash and does not emit twice", () =>
+  it.live("recovers an idempotent durable publish crash before the journal marker without emitting twice", () =>
     Effect.gen(function* () {
       yield* seedProject()
       let emitted = 0
       let fail = true
+      const durable = new Set<string>()
       const first = yield* make({
         afterPublish: () =>
           Effect.suspend(() => (fail ? ((fail = false), Effect.fail(new Error("crash after publish"))) : Effect.void)),
@@ -358,7 +381,12 @@ describe("project deletion coordinator", () => {
       const actions = {
         revokeShares: () => Effect.void,
         cleanup: () => Effect.void,
-        publish: () => Effect.sync(() => (emitted += 1)),
+        publish: (_projectID: ProjectV2.ID, eventID: EventV2.ID) =>
+          Effect.sync(() => {
+            if (durable.has(eventID)) return
+            durable.add(eventID)
+            emitted += 1
+          }),
       }
       first.install(actions)
       expect(yield* first.begin(projectID)).toBe("owner")
@@ -369,12 +397,14 @@ describe("project deletion coordinator", () => {
       recovered.install(actions)
       yield* recovered.recover()
       expect(emitted).toBe(1)
+      expect(durable.size).toBe(1)
     }),
   )
 
   it.live("cleans interrupted ownership and bounds shutdown drain", () =>
     Effect.gen(function* () {
       yield* seedProject()
+      const { db } = yield* Database.Service
       const entered = yield* Deferred.make<void>()
       const coordinator = yield* make({ shutdownTimeout: "20 millis" })
       coordinator.install({
@@ -389,11 +419,48 @@ describe("project deletion coordinator", () => {
       expect(yield* coordinator.ownerCount()).toBe(0)
       yield* coordinator.prepareShutdown()
 
+      const afterClose = ProjectV2.ID.make("proj_after_shutdown")
+      yield* db
+        .insert(ProjectTable)
+        .values({
+          id: afterClose,
+          worktree: AbsolutePath.make("C:\\repo\\after-shutdown"),
+          vcs: "git",
+          sandboxes: [],
+          time_created: 1,
+          time_updated: 1,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      expect(yield* coordinator.begin(afterClose)).toBe("in_progress")
+      expect(yield* coordinator.ownerCount()).toBe(0)
+      yield* db
+        .insert(ProjectDeletionJobTable)
+        .values({
+          project_id: afterClose,
+          phase: "cleaning",
+          attempt: 0,
+          last_error: null,
+          created_at: 1,
+          updated_at: 1,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* coordinator.recover()
+      expect(yield* coordinator.ownerCount()).toBe(0)
+      expect(
+        yield* db
+          .select()
+          .from(ProjectDeletionJobTable)
+          .where(eq(ProjectDeletionJobTable.project_id, afterClose))
+          .get()
+          .pipe(Effect.orDie),
+      ).toBeDefined()
+
       const stuck = yield* make({ shutdownTimeout: "20 millis" })
       expect(yield* stuck.begin(projectID)).toBe("in_progress")
       // Use a second project to create an owner that never reaches execute.
       const orphan = ProjectV2.ID.make("proj_shutdown_orphan")
-      const { db } = yield* Database.Service
       yield* db
         .insert(ProjectTable)
         .values({

@@ -524,24 +524,32 @@ const layer = Layer.effect(
         OTEL_RESOURCE_ATTRIBUTES: process.env.OTEL_RESOURCE_ATTRIBUTES,
       }
 
-      yield* deletion.withMutation(
+      yield* deletion.withLease(
         input.projectID,
-        db
-          .insert(WorkspaceTable)
-          .values({
-            id: info.id,
-            type: info.type,
-            branch: info.branch,
-            name: info.name,
-            directory: info.directory,
-            extra: info.extra,
-            project_id: info.projectID,
-            time_used: info.timeUsed,
-          })
-          .run()
-          .pipe(Effect.orDie),
+        () => Effect.void,
+        Effect.gen(function* () {
+          yield* deletion.withMutation(
+            input.projectID,
+            db
+              .insert(WorkspaceTable)
+              .values({
+                id: info.id,
+                type: info.type,
+                branch: info.branch,
+                name: info.name,
+                directory: info.directory,
+                extra: info.extra,
+                project_id: info.projectID,
+                time_used: info.timeUsed,
+              })
+              .run()
+              .pipe(Effect.orDie),
+          )
+          // Adapter creation is an external side effect. Keep the deletion lease
+          // until its promise settles even if the caller is interrupted.
+          yield* WorkspaceAdapterRuntime.create(adapter, config, env).pipe(Effect.uninterruptible)
+        }),
       )
-      yield* WorkspaceAdapterRuntime.create(adapter, config, env)
       yield* Effect.all(
         [
           waitEvent({
