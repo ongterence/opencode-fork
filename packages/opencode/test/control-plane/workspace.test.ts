@@ -801,7 +801,7 @@ describe("workspace CRUD", () => {
   )
 
   it.instance(
-    "remove still deletes the row when the adapter cannot remove resources",
+    "remove retains the row when mandatory adapter cleanup fails",
     () =>
       Effect.gen(function* () {
         const instance = yield* requireInstance
@@ -822,8 +822,9 @@ describe("workspace CRUD", () => {
         )
         yield* insertWorkspace(info)
 
-        expect(yield* workspace.remove(info.id)).toEqual(info)
-        expect(yield* workspace.get(info.id)).toBeUndefined()
+        const removed = yield* Effect.exit(workspace.remove(info.id))
+        expect(Exit.isFailure(removed)).toBe(true)
+        expect(yield* workspace.get(info.id)).toEqual(info)
       }),
     { git: true },
   )

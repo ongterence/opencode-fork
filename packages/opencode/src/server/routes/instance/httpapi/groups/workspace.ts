@@ -3,7 +3,7 @@ import { WorkspaceAdapterEntry } from "@/control-plane/types"
 import { Schema, Struct } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import { ApiVcsApplyError } from "./instance"
-import { ApiNotFoundError } from "../errors"
+import { ApiNotFoundError, ProjectDeletionInProgressError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -74,7 +74,7 @@ export const WorkspaceApi = HttpApi.make("workspace")
           query: WorkspaceRoutingQuery,
           payload: CreatePayload,
           success: described(Workspace.Info, "Workspace created"),
-          error: [ApiWorkspaceCreateError, HttpApiError.BadRequest],
+          error: [ApiWorkspaceCreateError, HttpApiError.BadRequest, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "experimental.workspace.create",
@@ -85,6 +85,7 @@ export const WorkspaceApi = HttpApi.make("workspace")
         HttpApiEndpoint.post("syncList", WorkspacePaths.syncList, {
           query: WorkspaceRoutingQuery,
           success: described(HttpApiSchema.NoContent, "Workspace list synced"),
+          error: ProjectDeletionInProgressError,
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "experimental.workspace.syncList",

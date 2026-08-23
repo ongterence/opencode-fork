@@ -134,7 +134,9 @@ function withContext<A, E>(
               return Bun.write(`${directory()}/${name}`, content)
             }).pipe(Effect.asVoid),
           session: (input) =>
-            run(modules.Session.Service.use((svc) => svc.create({ title: input?.title, parentID: input?.parentID }))),
+            run(
+              modules.Session.Service.use((svc) => svc.create({ title: input?.title, parentID: input?.parentID })),
+            ).pipe(Effect.catchTag("ProjectDeletingError", () => Effect.interrupt)),
           sessionGet: (sessionID) =>
             run(modules.Session.Service.use((svc) => svc.get(sessionID))).pipe(
               Effect.catchCause(() => Effect.succeed(undefined)),

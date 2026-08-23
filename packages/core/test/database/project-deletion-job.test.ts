@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import projectDeletionJobMigration from "@opencode-ai/core/database/migration/20260823_project_deletion_job"
+import projectDeletionDeliveryMigration from "@opencode-ai/core/database/migration/20260823_project_deletion_outbox"
 import { Effect } from "effect"
 import { sql } from "drizzle-orm"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
@@ -22,6 +23,7 @@ describe("project deletion job migration", () => {
 
         yield* DatabaseMigration.applyOnly(db, [projectDeletionJobMigration])
         yield* DatabaseMigration.applyOnly(db, [projectDeletionJobMigration])
+        yield* DatabaseMigration.applyOnly(db, [projectDeletionDeliveryMigration])
 
         expect(
           yield* db.all(
@@ -36,24 +38,34 @@ describe("project deletion job migration", () => {
           yield* db.all(
             sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('project_deletion_job_phase_idx', 'project_deletion_share_status_idx') ORDER BY name`,
           ),
-        ).toEqual([
-          { name: "project_deletion_job_phase_idx" },
-          { name: "project_deletion_share_status_idx" },
-        ])
-        expect(yield* db.all(sql`SELECT name, pk FROM pragma_table_info('project_deletion_job') WHERE pk > 0 ORDER BY pk`)).toEqual([
-          { name: "project_id", pk: 1 },
-        ])
-        expect(yield* db.get(sql`SELECT name, "notnull" AS "notnull", pk FROM pragma_table_info('project_deletion_job') WHERE name = 'project_id'`)).toEqual({
+        ).toEqual([{ name: "project_deletion_job_phase_idx" }, { name: "project_deletion_share_status_idx" }])
+        expect(
+          yield* db.all(sql`SELECT name, pk FROM pragma_table_info('project_deletion_job') WHERE pk > 0 ORDER BY pk`),
+        ).toEqual([{ name: "project_id", pk: 1 }])
+        expect(
+          yield* db.get(
+            sql`SELECT name, "notnull" AS "notnull", pk FROM pragma_table_info('project_deletion_job') WHERE name = 'project_id'`,
+          ),
+        ).toEqual({
           name: "project_id",
           notnull: 1,
           pk: 1,
         })
-        expect(yield* db.all(sql`SELECT name, pk FROM pragma_table_info('project_deletion_share') WHERE pk > 0 ORDER BY pk`)).toEqual([
+        expect(
+          yield* db.all(
+            sql`SELECT name FROM pragma_table_info('project_deletion_job') WHERE name IN ('event_id', 'event_delivered_at') ORDER BY name`,
+          ),
+        ).toEqual([{ name: "event_delivered_at" }, { name: "event_id" }])
+        expect(
+          yield* db.all(sql`SELECT name, pk FROM pragma_table_info('project_deletion_share') WHERE pk > 0 ORDER BY pk`),
+        ).toEqual([
           { name: "project_id", pk: 1 },
           { name: "session_id", pk: 2 },
         ])
         expect(
-          yield* db.all(sql`SELECT name, pk FROM pragma_table_info('project_deletion_worktree') WHERE pk > 0 ORDER BY pk`),
+          yield* db.all(
+            sql`SELECT name, pk FROM pragma_table_info('project_deletion_worktree') WHERE pk > 0 ORDER BY pk`,
+          ),
         ).toEqual([
           { name: "project_id", pk: 1 },
           { name: "canonical_path", pk: 2 },
@@ -77,7 +89,11 @@ describe("project deletion job migration", () => {
           { name: "project_deletion_share" },
           { name: "project_deletion_worktree" },
         ])
-        expect(yield* db.get(sql`SELECT name, "notnull" AS "notnull", pk FROM pragma_table_info('project_deletion_job') WHERE name = 'project_id'`)).toEqual({
+        expect(
+          yield* db.get(
+            sql`SELECT name, "notnull" AS "notnull", pk FROM pragma_table_info('project_deletion_job') WHERE name = 'project_id'`,
+          ),
+        ).toEqual({
           name: "project_id",
           notnull: 1,
           pk: 1,

@@ -34,7 +34,7 @@ import { InstanceStore } from "@/project/instance-store"
 import { WorkspaceAdapterRuntime } from "./workspace-adapter-runtime"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import { WorkspaceEvent } from "@opencode-ai/schema/workspace-event"
-import { ProjectDeletionCoordinator } from "@/project/deletion-coordinator"
+import { ProjectDeletionCoordinator, type ProjectDeletingError } from "@/project/deletion-coordinator"
 
 export const Info = Schema.Struct({
   ...WorkspaceInfoSchema.fields,
@@ -119,7 +119,7 @@ export class SyncAbortedError extends Schema.TaggedErrorClass<SyncAbortedError>(
   cause: Schema.optional(Schema.Defect()),
 }) {}
 
-type CreateError = Auth.AuthError
+type CreateError = Auth.AuthError | ProjectDeletingError
 type SessionWarpError =
   | WorkspaceNotFoundError
   | SessionEventsNotFoundError
@@ -133,7 +133,7 @@ export interface Interface {
   readonly create: (input: CreateInput) => Effect.Effect<Info, CreateError>
   readonly sessionWarp: (input: SessionWarpInput) => Effect.Effect<void, SessionWarpError>
   readonly list: (project: Project.Info) => Effect.Effect<Info[]>
-  readonly syncList: (project: Project.Info) => Effect.Effect<void>
+  readonly syncList: (project: Project.Info) => Effect.Effect<void, ProjectDeletingError>
   readonly get: (id: WorkspaceV2.ID) => Effect.Effect<Info | undefined>
   readonly remove: (id: WorkspaceV2.ID) => Effect.Effect<Info | undefined>
   readonly status: () => Effect.Effect<ConnectionStatus[]>
@@ -471,32 +471,29 @@ const layer = Layer.effect(
       if (exists && connections.get(space.id)?.status !== "error") return
 
       setStatus(space.id, "disconnected")
-      const release = yield* deletion
-        .lease(space.projectID, `workspace:${space.id}`, () => stopSync(space.id))
-        .pipe(Effect.orDie)
-
       yield* FiberMap.run(
         syncFibers,
         space.id,
         // TODO: look into `tapError` to set the status but still
         // allow the fiber to fail and automatically get removed
-        syncWorkspaceLoop(space).pipe(
-          Effect.catch((error) =>
-            Effect.gen(function* () {
-              setStatus(space.id, "error")
-              yield* Effect.logWarning("workspace listener failed", {
-                workspaceID: space.id,
-                error: errorData(error),
-              })
-            }),
+        deletion
+          .withLease(space.projectID, () => stopSync(space.id), syncWorkspaceLoop(space))
+          .pipe(
+            Effect.catch((error) =>
+              Effect.gen(function* () {
+                setStatus(space.id, "error")
+                yield* Effect.logWarning("workspace listener failed", {
+                  workspaceID: space.id,
+                  error: errorData(error),
+                })
+              }),
+            ),
           ),
-          Effect.ensuring(release),
-        ),
       )
     })
 
     const create = Effect.fn("Workspace.create")(function* (input: CreateInput) {
-      yield* deletion.assertWritable(input.projectID).pipe(Effect.orDie)
+      yield* deletion.assertWritable(input.projectID)
       const id = WorkspaceV2.ID.ascending(input.id)
       const adapter = getAdapter(input.projectID, input.type)
       const config = yield* WorkspaceAdapterRuntime.configure(adapter, {
@@ -518,22 +515,6 @@ const layer = Layer.effect(
         timeUsed: Date.now(),
       }
 
-      yield* deletion.assertWritable(input.projectID).pipe(Effect.orDie)
-      yield* db
-        .insert(WorkspaceTable)
-        .values({
-          id: info.id,
-          type: info.type,
-          branch: info.branch,
-          name: info.name,
-          directory: info.directory,
-          extra: info.extra,
-          project_id: info.projectID,
-          time_used: info.timeUsed,
-        })
-        .run()
-        .pipe(Effect.orDie)
-
       const env = {
         OPENCODE_AUTH_CONTENT: JSON.stringify(yield* auth.all()),
         OPENCODE_WORKSPACE_ID: config.id,
@@ -543,6 +524,23 @@ const layer = Layer.effect(
         OTEL_RESOURCE_ATTRIBUTES: process.env.OTEL_RESOURCE_ATTRIBUTES,
       }
 
+      yield* deletion.withMutation(
+        input.projectID,
+        db
+          .insert(WorkspaceTable)
+          .values({
+            id: info.id,
+            type: info.type,
+            branch: info.branch,
+            name: info.name,
+            directory: info.directory,
+            extra: info.extra,
+            project_id: info.projectID,
+            time_used: info.timeUsed,
+          })
+          .run()
+          .pipe(Effect.orDie),
+      )
       yield* WorkspaceAdapterRuntime.create(adapter, config, env)
       yield* Effect.all(
         [
@@ -733,7 +731,6 @@ const layer = Layer.effect(
     })
 
     const syncList = Effect.fn("Workspace.syncList")(function* (project: Project.Info) {
-      yield* deletion.assertWritable(project.id).pipe(Effect.orDie)
       const names = new Set((yield* list(project)).map((workspace) => workspace.name))
       const discovered = yield* Effect.forEach(
         registeredAdapters(project.id),
@@ -764,21 +761,23 @@ const layer = Layer.effect(
               timeUsed: Date.now(),
             }
 
-            yield* deletion.assertWritable(project.id).pipe(Effect.orDie)
-            yield* db
-              .insert(WorkspaceTable)
-              .values({
-                id: info.id,
-                type: info.type,
-                branch: info.branch,
-                name: info.name,
-                directory: info.directory,
-                extra: info.extra,
-                project_id: info.projectID,
-                time_used: info.timeUsed,
-              })
-              .run()
-              .pipe(Effect.orDie)
+            yield* deletion.withMutation(
+              project.id,
+              db
+                .insert(WorkspaceTable)
+                .values({
+                  id: info.id,
+                  type: info.type,
+                  branch: info.branch,
+                  name: info.name,
+                  directory: info.directory,
+                  extra: info.extra,
+                  project_id: info.projectID,
+                  time_used: info.timeUsed,
+                })
+                .run()
+                .pipe(Effect.orDie),
+            )
 
             yield* startSync(info)
           }),
@@ -813,12 +812,7 @@ const layer = Layer.effect(
       yield* stopSync(id)
 
       const info = fromRow(row)
-      yield* Effect.catchCause(
-        Effect.gen(function* () {
-          yield* WorkspaceAdapterRuntime.remove(info)
-        }),
-        () => Effect.logError("adapter not available when removing workspace", { type: row.type }),
-      )
+      yield* WorkspaceAdapterRuntime.remove(info).pipe(Effect.orDie)
 
       yield* db.delete(WorkspaceTable).where(eq(WorkspaceTable.id, id)).run().pipe(Effect.orDie)
       return info
@@ -861,7 +855,13 @@ const layer = Layer.effect(
     })
 
     const startWorkspaceSyncing = Effect.fn("Workspace.startWorkspaceSyncing")(function* (projectID: ProjectV2.ID) {
-      yield* deletion.assertWritable(projectID).pipe(Effect.orDie)
+      if (
+        yield* deletion.assertWritable(projectID).pipe(
+          Effect.as(false),
+          Effect.catchTag("ProjectDeletingError", () => Effect.succeed(true)),
+        )
+      )
+        return
       const rows = yield* db
         .selectDistinct({ workspace: WorkspaceTable })
         .from(WorkspaceTable)

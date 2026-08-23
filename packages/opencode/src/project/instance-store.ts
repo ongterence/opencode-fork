@@ -57,6 +57,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
                   worktree: result.sandbox,
                   project: result.project,
                 })),
+                Effect.catchTag("ProjectDeletingError", () => Effect.interrupt),
               )
         yield* bootstrap.run.pipe(Effect.provideService(InstanceRef, ctx))
         return ctx

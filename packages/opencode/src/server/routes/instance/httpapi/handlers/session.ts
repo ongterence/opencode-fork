@@ -36,13 +36,21 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { notFound, PermissionNotFoundError, ProjectDeletionInProgressError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
   Effect.try({
     try: () => JSON.parse(text) as unknown,
     catch: () => new HttpApiError.BadRequest({}),
+  })
+
+const projectDeleting = (error: { projectID: string; phase: string }) =>
+  new ProjectDeletionInProgressError({
+    projectID: error.projectID,
+    phase: error.phase,
+    code: "project_deletion_in_progress",
+    message: `Project deletion is in progress: ${error.projectID}`,
   })
 
 export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", (handlers) =>
@@ -153,7 +161,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput }) {
-      return yield* shareSvc.create(ctx.payload)
+      return yield* shareSvc
+        .create(ctx.payload)
+        .pipe(Effect.catchTag("ProjectDeletingError", (error) => Effect.fail(projectDeleting(error))))
     })
 
     const createRaw = Effect.fn("SessionHttpApi.createRaw")(function* (ctx: {
@@ -185,21 +195,20 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof UpdatePayload.Type
     }) {
       const current = yield* requireSession(ctx.params.sessionID)
-      if (ctx.payload.title !== undefined) {
-        yield* session.setTitle({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
-      }
-      if (ctx.payload.metadata !== undefined) {
-        yield* session.setMetadata({ sessionID: ctx.params.sessionID, metadata: ctx.payload.metadata })
-      }
-      if (ctx.payload.permission !== undefined) {
-        yield* session.setPermission({
-          sessionID: ctx.params.sessionID,
-          permission: Permission.merge(current.permission ?? [], ctx.payload.permission),
+      yield* session
+        .patchWritable(ctx.params.sessionID, {
+          title: ctx.payload.title,
+          metadata: ctx.payload.metadata,
+          permission:
+            ctx.payload.permission === undefined
+              ? undefined
+              : Permission.merge(current.permission ?? [], ctx.payload.permission),
+          time: ctx.payload.time?.archived === undefined ? undefined : { archived: ctx.payload.time.archived },
         })
-      }
-      if (ctx.payload.time?.archived !== undefined) {
-        yield* session.setArchived({ sessionID: ctx.params.sessionID, time: ctx.payload.time.archived })
-      }
+        .pipe(
+          Effect.catchTag("NotFoundError", (error) => Effect.fail(notFound(error.message))),
+          Effect.catchTag("ProjectDeletingError", (error) => Effect.fail(projectDeleting(error))),
+        )
       return yield* requireSession(ctx.params.sessionID)
     })
 
@@ -207,12 +216,15 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload?: typeof ForkPayload.Type
     }) {
-      return yield* SessionError.mapStorageNotFound(
-        session.fork({
+      return yield* session
+        .fork({
           sessionID: ctx.params.sessionID,
           messageID: ctx.payload?.messageID,
-        }),
-      )
+        })
+        .pipe(
+          Effect.catchTag("NotFoundError", (error) => Effect.fail(notFound(error.message))),
+          Effect.catchTag("ProjectDeletingError", (error) => Effect.fail(projectDeleting(error))),
+        )
     })
 
     const forkRaw = Effect.fn("SessionHttpApi.forkRaw")(function* (ctx: {
@@ -258,7 +270,15 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     // every failure to a 400 BadRequest.
     const share = Effect.fn("SessionHttpApi.share")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* shareSvc.share(ctx.params.sessionID).pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      yield* shareSvc
+        .share(ctx.params.sessionID)
+        .pipe(
+          Effect.mapError((error) =>
+            typeof error === "object" && error !== null && "_tag" in error && error._tag === "ProjectDeletingError"
+              ? projectDeleting(error as unknown as { projectID: string; phase: string })
+              : new HttpApiError.InternalServerError({}),
+          ),
+        )
       return yield* requireSession(ctx.params.sessionID)
     })
 
@@ -302,7 +322,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           ...ctx.payload,
           sessionID: ctx.params.sessionID,
         })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .pipe(
+          Effect.mapError((error) =>
+            typeof error === "object" && error !== null && "_tag" in error && error._tag === "ProjectDeletingError"
+              ? projectDeleting(error as unknown as { projectID: string; phase: string })
+              : new HttpApiError.BadRequest({}),
+          ),
+        )
       return HttpServerResponse.stream(Stream.make(JSON.stringify(message)).pipe(Stream.encodeText), {
         contentType: "application/json",
       })
@@ -313,6 +339,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
+      yield* session
+        .assertWritable(ctx.params.sessionID)
+        .pipe(Effect.catchTag("ProjectDeletingError", (error) => Effect.fail(projectDeleting(error))))
       yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {

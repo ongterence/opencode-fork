@@ -29,6 +29,8 @@ export default {
           \`phase\` text NOT NULL,
           \`attempt\` integer NOT NULL,
           \`last_error\` text,
+          \`event_id\` text,
+          \`event_delivered_at\` integer,
           \`created_at\` integer NOT NULL,
           \`updated_at\` integer NOT NULL
         );

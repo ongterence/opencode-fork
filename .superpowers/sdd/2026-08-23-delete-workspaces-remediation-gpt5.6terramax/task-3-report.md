@@ -121,3 +121,113 @@ The pre-existing user modifications in `packages/app/src/custom-elements.d.ts` a
 - Task 5 still owns the complete contained mandatory cleanup rewrite. The coordinator preserves non-share cleanup failures at the current durable phase and will retry them, but the existing cleanup action remains the landed best-effort implementation until Task 5 replaces every raw legacy target and swallowed mandatory error.
 - `prepareShutdown` closes mutation admission and waits for all keyed owners. The coordinator contains no unjournaled destructive critical section; Task 6 will expose this boundary to the sidecar/updater lifecycle and add bounded user-facing failure behavior.
 - The coordinator fence is process-local before the journal transaction and durable after it. This application currently has one writer process; a future multi-process writer would need the mutation itself and the journal check to share a database transaction or an equivalent cross-process admission lock.
+
+---
+
+## Fix round 1 — commit-boundary fencing and recovery hardening
+
+### Review findings reproduced
+
+The coordinator tests were expanded before the implementation changed. From `packages/opencode`:
+
+```text
+$ bun test test/project/deletion-coordinator.test.ts
+4 pass
+6 fail
+```
+
+The failures were the intended red evidence:
+
+- `coordinator.withLease is not a function` for concurrent and interrupted lease cases.
+- `coordinator.withMutation is not a function` for the commit-boundary race.
+- bounded recovery expected three cleanup attempts but observed one.
+- the publish-before-transition injection observed terminal completion instead of retaining `cleanup_complete`.
+- the shutdown-boundary test timed out because owner drain had no bound.
+
+The existing code inspection also confirmed every reported cause: `assertWritable` was a separate read before the write, caller-provided lease keys collided, publication had no durable delivery marker, local recovery ran once, shutdown polled indefinitely, cleanup swallowed required failures, and mutation fences were converted to defects with `Effect.orDie`.
+
+### Implemented corrections
+
+- Replaced the check-then-write path with `withMutation`, backed by the existing keyed mutex. The durable journal check and the mutation effect now execute under the same per-project gate. Deletion installs `closing` synchronously, then takes that same gate for the immediate snapshot transaction.
+- Added `withLease` using `Effect.acquireUseRelease` and a unique `Symbol` token per admitted operation. Acquisition installs the lease before releasing the gate and the finalizer is guaranteed on success, failure, or interruption.
+- Added owner-completion `Deferred`s. `execute` releases ownership on every exit, and `prepareShutdown` waits on those completions with a bounded timeout that fails with `DeletionBusyError`.
+- Added bounded, delayed recovery retries for non-share local phases. `share_failed` remains intentionally user-retryable and is not auto-purged.
+- Added durable `event_id` and `event_delivered_at` columns through the narrowly required `20260823_project_deletion_outbox` migration. Publication receives a stable event id and records synchronous delivery before the later phase transition; restart skips an already delivered event.
+- Removed best-effort swallowing at the current mandatory cleanup boundary. Filesystem removal, git worktree/branch removal, workspace adapter removal, and session/workspace cleanup failures now stop the coordinator in its durable local phase. No terminal event or journal deletion occurs.
+- Routed project upsert/update, session create/update, prompt admission, workspace create/discovery commits, and share creation through the coordinator gates. Prompt and workspace sync use the scoped unique-lease API and existing cancellation callbacks.
+- Preserved `ProjectDeletingError` in public service channels and mapped it to `ProjectDeletionInProgressError` (`409`, code `project_deletion_in_progress`) in project, session, prompt, workspace, and share HTTP mutation routes. Internal already-admitted streaming writers convert a later fence to interruption so cancellation remains the control path; no deletion fence is converted to a defect.
+
+### Green verification
+
+Coordinator and real HTTP mutation mapping, from `packages/opencode`:
+
+```text
+$ bun test test/project/deletion-coordinator.test.ts test/server/project-global-delete.test.ts
+14 pass
+0 fail
+61 expect() calls
+Ran 14 tests across 2 files. [8.49s]
+```
+
+The HTTP barrier test creates a session, seeds a durable `quiescing` job, concurrently attempts project update, session create, session update, prompt admission, workspace create, and share create, and observes six typed 409 responses. It also verifies the project update did not commit.
+
+Touched-service regression suite, from `packages/opencode`:
+
+```text
+$ bun test --timeout 15000 test/project/deletion-coordinator.test.ts test/server/project-global-delete.test.ts test/session/session.test.ts test/control-plane/workspace.test.ts test/share/share-next.test.ts
+63 pass
+1 skip
+0 fail
+238 expect() calls
+Ran 64 tests across 5 files. [46.86s]
+```
+
+The pre-existing 5-second timeout was insufficient for two live HTTP tests on this Windows checkout. Both were rerun with the same 15-second test timeout used above:
+
+```text
+$ bun test --timeout 15000 test/server/httpapi-workspace.test.ts -t "creates a real git worktree"
+1 pass
+0 fail
+
+$ bun test --timeout 15000 test/server/httpapi-session.test.ts -t "persisted session directory"
+1 pass
+0 fail
+```
+
+Core migration verification, from `packages/core`:
+
+```text
+$ bun test test/database/project-deletion-job.test.ts; bun run typecheck
+2 pass
+0 fail
+9 expect() calls
+$ tsgo --noEmit
+```
+
+Project-wide verification, from the repository root:
+
+```text
+$ bun run typecheck
+Tasks:    30 successful, 30 total
+Cached:   28 cached, 30 total
+Time:     32.362s
+```
+
+Targeted lint reported zero errors (`44 warnings`, all in existing broad files and predominantly pre-existing unsafe-assertion/unused-import findings).
+
+### Fix-round changed files
+
+- Core durable outbox: `packages/core/src/project/deletion.sql.ts`, `packages/core/src/database/migration/20260823_project_deletion_outbox.ts`, `packages/core/src/database/migration.gen.ts`, `packages/core/src/database/schema.gen.ts`, `packages/core/schema.json`, and `packages/core/test/database/project-deletion-job.test.ts`.
+- Coordinator and cleanup: `packages/opencode/src/project/deletion-coordinator.ts`, `packages/opencode/src/project/removal.ts`.
+- Commit gates/admission: `packages/opencode/src/project/project.ts`, `packages/opencode/src/project/instance-store.ts`, `packages/opencode/src/session/session.ts`, `packages/opencode/src/session/prompt.ts`, `packages/opencode/src/control-plane/workspace.ts`, `packages/opencode/src/share/share-next.ts`, `packages/opencode/src/share/session.ts`, and the CLI/test adapters that explicitly handle the new typed session-create channel.
+- Typed HTTP contract: project/session/workspace HttpApi group and handler files.
+- Tests: `packages/opencode/test/project/deletion-coordinator.test.ts`, `packages/opencode/test/server/project-global-delete.test.ts`, and `packages/opencode/test/control-plane/workspace.test.ts`.
+
+The two pre-existing custom-elements declaration files remain user-owned, unmodified by this task, and are excluded from the commit.
+
+### Necessary deviations and remaining boundaries
+
+- The outbox columns are a necessary schema addition beyond the original Task 3 table shape. Without a stable event id and durable delivered marker, recovery could not distinguish publication completed before a phase-transition crash.
+- Publication is currently a synchronous in-process `GlobalBus` delivery. The stable id plus delivered marker guarantees the tested publish-before-phase-transition recovery boundary. If publication later becomes an asynchronous external broker operation, the broker/consumer must use the stable id for idempotency or the outbox must gain an acknowledged relay; an external side effect cannot be made exactly-once by SQLite alone.
+- Workspace adapter creation runs after the workspace row's gated commit because the builtin adapter re-enters project mutation (`addSandbox`). Holding the non-reentrant project gate across that adapter call deadlocks. The row is therefore always visible to a deletion snapshot before the external adapter side effect starts, and adapter failure retains the row as the existing contract requires.
+- Task 4 still owns historical share-credential revocation semantics. Task 5 still owns the complete path inventory and final cleanup implementation. This fix only strengthens the current action boundary so a required cleanup failure cannot produce terminal success.

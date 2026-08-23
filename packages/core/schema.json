@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "e17d0f9c-8fe6-4368-a646-cf0512e61e96",
+  "id": "7c6bf4bf-f333-4a84-9f7a-fd344359f27b",
   "prevIds": [
-    "f14a9b18-8207-487e-a3d3-227e629ba9ad"
+    "e17d0f9c-8fe6-4368-a646-cf0512e61e96"
   ],
   "ddl": [
     {
@@ -196,7 +196,7 @@
     },
     {
       "type": "text",
-      "notNull": true,
+      "notNull": false,
       "autoincrement": false,
       "default": null,
       "generated": null,
@@ -231,6 +231,26 @@
       "default": null,
       "generated": null,
       "name": "last_error",
+      "entityType": "columns",
+      "table": "project_deletion_job"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "event_id",
+      "entityType": "columns",
+      "table": "project_deletion_job"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "event_delivered_at",
       "entityType": "columns",
       "table": "project_deletion_job"
     },

@@ -20,7 +20,7 @@ import {
   WorkspaceRoutingQuery,
   WorkspaceRoutingQueryFields,
 } from "../middleware/workspace-routing"
-import { ApiNotFoundError, PermissionNotFoundError, SessionBusyError } from "../errors"
+import { ApiNotFoundError, PermissionNotFoundError, ProjectDeletionInProgressError, SessionBusyError } from "../errors"
 import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -121,7 +121,7 @@ export const SessionApi = HttpApi.make("session")
         HttpApiEndpoint.get("status", SessionPaths.status, {
           query: WorkspaceRoutingQuery,
           success: described(StatusMap, "Get session status"),
-          error: HttpApiError.BadRequest,
+          error: [HttpApiError.BadRequest, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.status",
@@ -133,7 +133,7 @@ export const SessionApi = HttpApi.make("session")
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
           success: described(Session.Info, "Get session"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.get",
@@ -204,7 +204,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: [HttpApiSchema.NoContent, Session.CreateInput],
           success: described(Session.Info, "Successfully created session"),
-          error: HttpApiError.BadRequest,
+          error: [HttpApiError.BadRequest, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.create",
@@ -229,7 +229,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: UpdatePayload,
           success: described(Session.Info, "Successfully updated session"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.update",
@@ -242,7 +242,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: [HttpApiSchema.NoContent, ForkPayload],
           success: described(Session.Info, "200"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.fork",
@@ -280,7 +280,7 @@ export const SessionApi = HttpApi.make("session")
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
           success: described(Session.Info, "Successfully shared session"),
-          error: [HttpApiError.InternalServerError, ApiNotFoundError],
+          error: [HttpApiError.InternalServerError, ApiNotFoundError, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.share",
@@ -318,7 +318,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PromptPayload,
           success: described(SessionV1.WithParts, "Created message"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.prompt",
@@ -331,7 +331,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PromptPayload,
           success: described(HttpApiSchema.NoContent, "Prompt accepted"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.prompt_async",

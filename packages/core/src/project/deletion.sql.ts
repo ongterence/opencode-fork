@@ -42,6 +42,8 @@ export const ProjectDeletionJobTable = sqliteTable(
     phase: text().$type<DeletionPhase>().notNull(),
     attempt: integer().notNull(),
     last_error: text(),
+    event_id: text(),
+    event_delivered_at: integer(),
     created_at: integer().notNull(),
     updated_at: integer().notNull(),
   },

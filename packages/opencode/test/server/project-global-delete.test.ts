@@ -140,4 +140,84 @@ describe("global project delete endpoint", () => {
       }),
     { git: true },
   )
+
+  it.instance(
+    "maps fenced project, session, prompt, workspace, and share mutations to 409",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: string }
+        const created = yield* requestInDirectory("/session", tmp.directory, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        })
+        expect(created.status).toBe(200)
+        const session = (yield* created.json) as { id: string }
+
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(ProjectDeletionJobTable)
+          .values({
+            project_id: project.id,
+            phase: "quiescing",
+            attempt: 0,
+            last_error: null,
+            event_id: "evt_fence_routes",
+            event_delivered_at: null,
+            created_at: 1,
+            updated_at: 1,
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        const requests = [
+          requestInDirectory(`/project/${project.id}`, tmp.directory, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ name: "late" }),
+          }),
+          requestInDirectory("/session", tmp.directory, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}",
+          }),
+          requestInDirectory(`/session/${session.id}`, tmp.directory, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ title: "late" }),
+          }),
+          requestInDirectory(`/session/${session.id}/message`, tmp.directory, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test" },
+              parts: [{ type: "text", text: "late" }],
+            }),
+          }),
+          requestInDirectory("/experimental/workspace", tmp.directory, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ type: "missing", branch: null }),
+          }),
+          requestInDirectory(`/session/${session.id}/share`, tmp.directory, { method: "POST" }),
+        ]
+        const responses = yield* Effect.all(requests, { concurrency: "unbounded" })
+        expect(responses.map((response) => response.status)).toEqual([409, 409, 409, 409, 409, 409])
+        for (const response of responses) {
+          const body = (yield* response.json) as { code?: string }
+          expect(body.code).toBe("project_deletion_in_progress")
+        }
+
+        const row = (yield* db
+          .select({ id: ProjectTable.id, name: ProjectTable.name })
+          .from(ProjectTable)
+          .all()
+          .pipe(Effect.orDie)).find((entry) => entry.id === project.id)
+        expect(row?.name).not.toBe("late")
+      }),
+    { git: true },
+  )
 })

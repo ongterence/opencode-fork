@@ -128,7 +128,11 @@ const createToolContext = Effect.fn("Cli.debug.agent.createToolContext")(functio
   ctx: InstanceContext,
 ) {
   const sessionSvc = yield* Session.Service
-  const session = yield* sessionSvc.create({ title: `Debug tool run (${agent.name})` })
+  const session = yield* sessionSvc
+    .create({ title: `Debug tool run (${agent.name})` })
+    .pipe(
+      Effect.catchTag("ProjectDeletingError", (error) => fail(`Project deletion is in progress: ${error.projectID}`)),
+    )
   const messageID = MessageID.ascending()
   const model = agent.model
     ? agent.model

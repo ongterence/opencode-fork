@@ -1,6 +1,8 @@
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import { Database } from "@opencode-ai/core/database/database"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { EventV2 } from "@opencode-ai/core/event"
 import {
   type DeletionPhase,
   ProjectDeletionJobTable,
@@ -12,7 +14,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { eq, sql } from "drizzle-orm"
-import { Cause, Context, Deferred, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Deferred, Duration, Effect, Exit, Layer, Schema } from "effect"
 import { NotFoundError, NotRemovableError } from "./project-errors"
 
 export type DeleteOutcome =
@@ -33,24 +35,26 @@ export class DeletionBusyError extends Schema.TaggedErrorClass<DeletionBusyError
 export interface DeletionActions {
   readonly revokeShares: (projectID: ProjectV2.ID) => Effect.Effect<void, unknown>
   readonly cleanup: (projectID: ProjectV2.ID) => Effect.Effect<void, unknown>
-  readonly publish: (projectID: ProjectV2.ID) => Effect.Effect<void, unknown>
+  readonly publish: (projectID: ProjectV2.ID, eventID: EventV2.ID) => Effect.Effect<void, unknown>
 }
 
 export interface Interface {
-  readonly begin: (
-    projectID: ProjectV2.ID,
-  ) => Effect.Effect<"owner" | "in_progress", NotFoundError | NotRemovableError>
+  readonly begin: (projectID: ProjectV2.ID) => Effect.Effect<"owner" | "in_progress", NotFoundError | NotRemovableError>
   readonly execute: (projectID: ProjectV2.ID) => Effect.Effect<DeleteOutcome>
   readonly assertWritable: (projectID: ProjectV2.ID) => Effect.Effect<void, ProjectDeletingError>
+  readonly withMutation: <A, E, R>(
+    projectID: ProjectV2.ID,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | ProjectDeletingError, R>
+  readonly withLease: <A, E, R>(
+    projectID: ProjectV2.ID,
+    cancel: () => Effect.Effect<unknown, unknown>,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | ProjectDeletingError, R>
   readonly awaitQuiescence: (projectID: ProjectV2.ID) => Effect.Effect<void>
   readonly recover: () => Effect.Effect<void>
   readonly prepareShutdown: () => Effect.Effect<void, DeletionBusyError>
   readonly install: (actions: DeletionActions) => void
-  readonly lease: (
-    projectID: ProjectV2.ID,
-    key: string,
-    cancel: () => Effect.Effect<unknown, unknown>,
-  ) => Effect.Effect<Effect.Effect<void>, ProjectDeletingError>
   readonly ownerCount: () => Effect.Effect<number>
 }
 
@@ -58,92 +62,101 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Pr
 
 type Lease = { cancel: () => Effect.Effect<unknown, unknown> }
 
-export function make() {
+export type MakeOptions = {
+  readonly shutdownTimeout?: Duration.Input
+  readonly recoveryAttempts?: number
+  readonly recoveryDelay?: Duration.Input
+  readonly afterPublish?: () => Effect.Effect<void, unknown>
+}
+
+export function make(options: MakeOptions = {}) {
   return Effect.gen(function* () {
-  const { db } = yield* Database.Service
-  const owners = new Set<string>()
-  const closing = new Set<string>()
-  const leases = new Map<string, Map<string, Lease>>()
-  const waiters = new Map<string, Deferred.Deferred<void>>()
-  let actions: DeletionActions | undefined
-  let admissionClosed = false
+    const { db } = yield* Database.Service
+    const gates = KeyedMutex.makeUnsafe<string>()
+    const owners = new Map<string, Deferred.Deferred<void>>()
+    const closing = new Set<string>()
+    const leases = new Map<string, Map<symbol, Lease>>()
+    const waiters = new Map<string, Deferred.Deferred<void>>()
+    let actions: DeletionActions | undefined
+    let admissionClosed = false
 
-  const phase = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
-    return yield* db
-      .select({ phase: ProjectDeletionJobTable.phase, lastError: ProjectDeletionJobTable.last_error })
-      .from(ProjectDeletionJobTable)
-      .where(eq(ProjectDeletionJobTable.project_id, projectID))
-      .get()
-      .pipe(Effect.orDie)
-  })
-
-  const transition = Effect.fnUntraced(function* (
-    projectID: ProjectV2.ID,
-    next: DeletionPhase,
-    error: string | null = null,
-  ) {
-    yield* db
-      .transaction(
-        (tx) =>
-          tx
-            .update(ProjectDeletionJobTable)
-            .set({
-              phase: next,
-              last_error: error,
-              updated_at: Date.now(),
-              ...(error ? { attempt: sql`${ProjectDeletionJobTable.attempt} + 1` } : {}),
-            })
-            .where(eq(ProjectDeletionJobTable.project_id, projectID))
-            .run(),
-        { behavior: "immediate" },
-      )
-      .pipe(Effect.orDie)
-  })
-
-  const finish = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
-    yield* db
-      .transaction(
-        (tx) =>
-          Effect.gen(function* () {
-            yield* tx.delete(ProjectDeletionShareTable).where(eq(ProjectDeletionShareTable.project_id, projectID)).run()
-            yield* tx
-              .delete(ProjectDeletionWorktreeTable)
-              .where(eq(ProjectDeletionWorktreeTable.project_id, projectID))
-              .run()
-            yield* tx.delete(ProjectDeletionJobTable).where(eq(ProjectDeletionJobTable.project_id, projectID)).run()
-          }),
-        { behavior: "immediate" },
-      )
-      .pipe(Effect.orDie)
-  })
-
-  const assertWritable = Effect.fn("ProjectDeletionCoordinator.assertWritable")(function* (
-    projectID: ProjectV2.ID,
-  ) {
-    const current = yield* phase(projectID)
-    if (!admissionClosed && !closing.has(projectID) && !owners.has(projectID) && !current) return
-    return yield* new ProjectDeletingError({
-      projectID,
-      phase: current?.phase ?? (admissionClosed ? "shutdown" : "requested"),
+    const phase = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
+      return yield* db
+        .select({
+          phase: ProjectDeletionJobTable.phase,
+          lastError: ProjectDeletionJobTable.last_error,
+          eventID: ProjectDeletionJobTable.event_id,
+          eventDeliveredAt: ProjectDeletionJobTable.event_delivered_at,
+        })
+        .from(ProjectDeletionJobTable)
+        .where(eq(ProjectDeletionJobTable.project_id, projectID))
+        .get()
+        .pipe(Effect.orDie)
     })
-  })
 
-  const lease = Effect.fn("ProjectDeletionCoordinator.lease")(function* (
-    projectID: ProjectV2.ID,
-    key: string,
-    cancel: () => Effect.Effect<unknown, unknown>,
-  ) {
-    yield* assertWritable(projectID)
-    if (closing.has(projectID) || owners.has(projectID))
-      return yield* new ProjectDeletingError({ projectID, phase: "requested" })
-    const active = leases.get(projectID) ?? new Map<string, Lease>()
-    active.set(key, { cancel })
-    leases.set(projectID, active)
-    let released = false
-    return Effect.gen(function* () {
-      if (released) return
-      released = true
-      active.delete(key)
+    const transition = Effect.fnUntraced(function* (
+      projectID: ProjectV2.ID,
+      next: DeletionPhase,
+      error: string | null = null,
+    ) {
+      yield* db
+        .transaction(
+          (tx) =>
+            tx
+              .update(ProjectDeletionJobTable)
+              .set({
+                phase: next,
+                last_error: error,
+                updated_at: Date.now(),
+                ...(error ? { attempt: sql`${ProjectDeletionJobTable.attempt} + 1` } : {}),
+              })
+              .where(eq(ProjectDeletionJobTable.project_id, projectID))
+              .run(),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
+    })
+
+    const finish = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
+      yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              yield* tx
+                .delete(ProjectDeletionShareTable)
+                .where(eq(ProjectDeletionShareTable.project_id, projectID))
+                .run()
+              yield* tx
+                .delete(ProjectDeletionWorktreeTable)
+                .where(eq(ProjectDeletionWorktreeTable.project_id, projectID))
+                .run()
+              yield* tx.delete(ProjectDeletionJobTable).where(eq(ProjectDeletionJobTable.project_id, projectID)).run()
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
+    })
+
+    const assertWritableUnlocked = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
+      const current = yield* phase(projectID)
+      if (!admissionClosed && !closing.has(projectID) && !owners.has(projectID) && !current) return
+      return yield* new ProjectDeletingError({
+        projectID,
+        phase: current?.phase ?? (admissionClosed ? "shutdown" : "requested"),
+      })
+    })
+
+    const assertWritable = Effect.fn("ProjectDeletionCoordinator.assertWritable")(function* (projectID: ProjectV2.ID) {
+      yield* gates.withLock(projectID)(assertWritableUnlocked(projectID))
+    })
+
+    const withMutation: Interface["withMutation"] = (projectID, effect) =>
+      gates.withLock(projectID)(assertWritableUnlocked(projectID).pipe(Effect.andThen(effect)))
+
+    const releaseLease = Effect.fnUntraced(function* (projectID: ProjectV2.ID, token: symbol) {
+      const active = leases.get(projectID)
+      if (!active) return
+      active.delete(token)
       if (active.size > 0) return
       leases.delete(projectID)
       const waiter = waiters.get(projectID)
@@ -151,211 +164,290 @@ export function make() {
       waiters.delete(projectID)
       yield* Deferred.succeed(waiter, undefined)
     })
-  })
 
-  const awaitQuiescence = Effect.fn("ProjectDeletionCoordinator.awaitQuiescence")(function* (
-    projectID: ProjectV2.ID,
-  ) {
-    closing.add(projectID)
-    const active = leases.get(projectID)
-    if (!active || active.size === 0) return
-    const waiter = yield* Deferred.make<void>()
-    waiters.set(projectID, waiter)
-    yield* Effect.forEach(active.values(), (item) => item.cancel().pipe(Effect.ignore), { discard: true })
-    if ((leases.get(projectID)?.size ?? 0) === 0) yield* Deferred.succeed(waiter, undefined)
-    yield* Deferred.await(waiter)
-  })
+    const withLease: Interface["withLease"] = (projectID, cancel, effect) =>
+      Effect.acquireUseRelease(
+        gates.withLock(projectID)(
+          Effect.gen(function* () {
+            yield* assertWritableUnlocked(projectID)
+            const token = Symbol(projectID)
+            const active = leases.get(projectID) ?? new Map<symbol, Lease>()
+            active.set(token, { cancel })
+            leases.set(projectID, active)
+            return token
+          }),
+        ),
+        () => effect,
+        (token) => releaseLease(projectID, token),
+      )
 
-  const run = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
-    if (!actions) return { status: "in_progress", phase: (yield* phase(projectID))?.phase ?? "requested" } as const
-    const initial = yield* phase(projectID)
-    if (!initial) return { status: "completed" } as const
-    if (initial.phase === "share_failed")
-      return { status: "retryable_failure", phase: "share_failed", message: initial.lastError ?? "Share revocation failed" } as const
+    const awaitQuiescence = Effect.fn("ProjectDeletionCoordinator.awaitQuiescence")(function* (
+      projectID: ProjectV2.ID,
+    ) {
+      closing.add(projectID)
+      const active = leases.get(projectID)
+      if (!active || active.size === 0) return
+      const waiter = yield* Deferred.make<void>()
+      waiters.set(projectID, waiter)
+      yield* Effect.forEach(active.values(), (item) => item.cancel().pipe(Effect.ignore), { discard: true })
+      if ((leases.get(projectID)?.size ?? 0) === 0) yield* Deferred.succeed(waiter, undefined)
+      yield* Deferred.await(waiter)
+    })
 
-    if (initial.phase === "requested" || initial.phase === "revoking_shares") {
-      yield* transition(projectID, "revoking_shares")
-      const revoked = yield* actions.revokeShares(projectID).pipe(Effect.exit)
-      if (revoked._tag === "Failure") {
-        const message = Cause.pretty(revoked.cause)
-        yield* transition(projectID, "share_failed", message)
-        return { status: "retryable_failure", phase: "share_failed", message } as const
+    const actionFailure = Effect.fnUntraced(function* (
+      projectID: ProjectV2.ID,
+      current: DeletionPhase,
+      cause: Cause.Cause<unknown>,
+    ) {
+      if (Cause.hasInterruptsOnly(cause)) return yield* Effect.interrupt
+      const message = Cause.pretty(cause)
+      const next = current === "revoking_shares" ? "share_failed" : current
+      yield* transition(projectID, next, message)
+      return next === "share_failed"
+        ? ({ status: "retryable_failure", phase: "share_failed", message } as const)
+        : ({ status: "in_progress", phase: next } as const)
+    })
+
+    const deliver = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
+      const currentActions = actions
+      if (!currentActions) return
+      yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const job = yield* tx
+                .select({
+                  eventID: ProjectDeletionJobTable.event_id,
+                  deliveredAt: ProjectDeletionJobTable.event_delivered_at,
+                })
+                .from(ProjectDeletionJobTable)
+                .where(eq(ProjectDeletionJobTable.project_id, projectID))
+                .get()
+              if (!job || job.deliveredAt !== null) return
+              const eventID = EventV2.ID.make(job.eventID ?? EventV2.ID.create())
+              if (!job.eventID)
+                yield* tx
+                  .update(ProjectDeletionJobTable)
+                  .set({ event_id: eventID })
+                  .where(eq(ProjectDeletionJobTable.project_id, projectID))
+                  .run()
+              yield* currentActions.publish(projectID, eventID)
+              yield* tx
+                .update(ProjectDeletionJobTable)
+                .set({ event_delivered_at: Date.now(), updated_at: Date.now() })
+                .where(eq(ProjectDeletionJobTable.project_id, projectID))
+                .run()
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
+      if (options.afterPublish) yield* options.afterPublish()
+    })
+
+    const run = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
+      if (!actions) return { status: "in_progress", phase: (yield* phase(projectID))?.phase ?? "requested" } as const
+      const initial = yield* phase(projectID)
+      if (!initial) return { status: "completed" } as const
+      if (initial.phase === "share_failed")
+        return {
+          status: "retryable_failure",
+          phase: "share_failed",
+          message: initial.lastError ?? "Share revocation failed",
+        } as const
+
+      if (initial.phase === "requested" || initial.phase === "revoking_shares") {
+        yield* transition(projectID, "revoking_shares")
+        const outcome = yield* actions.revokeShares(projectID).pipe(
+          Effect.as<DeleteOutcome | undefined>(undefined),
+          Effect.catchCause((cause) => actionFailure(projectID, "revoking_shares", cause)),
+        )
+        if (outcome) return outcome
+        yield* transition(projectID, "quiescing")
       }
-      yield* transition(projectID, "quiescing")
+
+      if ((yield* phase(projectID))?.phase === "quiescing") {
+        yield* awaitQuiescence(projectID)
+        yield* transition(projectID, "cleaning")
+      }
+
+      if ((yield* phase(projectID))?.phase === "cleaning") {
+        const outcome = yield* actions.cleanup(projectID).pipe(
+          Effect.as<DeleteOutcome | undefined>(undefined),
+          Effect.catchCause((cause) => actionFailure(projectID, "cleaning", cause)),
+        )
+        if (outcome) return outcome
+        yield* transition(projectID, "cleanup_complete")
+      }
+
+      if ((yield* phase(projectID))?.phase === "cleanup_complete") {
+        const outcome = yield* deliver(projectID).pipe(
+          Effect.as<DeleteOutcome | undefined>(undefined),
+          Effect.catchCause((cause) => actionFailure(projectID, "cleanup_complete", cause)),
+        )
+        if (outcome) return outcome
+        yield* transition(projectID, "published")
+      }
+      yield* finish(projectID)
+      return { status: "completed" } as const
+    })
+
+    const releaseOwner = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
+      const done = owners.get(projectID)
+      owners.delete(projectID)
+      closing.delete(projectID)
+      if (done) yield* Deferred.succeed(done, undefined)
+    })
+
+    const execute: Interface["execute"] = (projectID) => run(projectID).pipe(Effect.ensuring(releaseOwner(projectID)))
+
+    const begin: Interface["begin"] = (projectID) => {
+      if (owners.has(projectID) || closing.has(projectID)) return Effect.succeed("in_progress" as const)
+      closing.add(projectID)
+      owners.set(projectID, Deferred.makeUnsafe<void>())
+      return gates
+        .withLock(projectID)(
+          db.transaction(
+            (tx) =>
+              Effect.gen(function* () {
+                if (projectID === ProjectV2.ID.global) return yield* new NotRemovableError({ projectID })
+                const existing = yield* tx
+                  .select({ phase: ProjectDeletionJobTable.phase })
+                  .from(ProjectDeletionJobTable)
+                  .where(eq(ProjectDeletionJobTable.project_id, projectID))
+                  .get()
+                if (existing) return "in_progress" as const
+                const project = yield* tx.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get()
+                if (!project) return yield* new NotFoundError({ projectID })
+                const now = Date.now()
+                yield* tx
+                  .insert(ProjectDeletionJobTable)
+                  .values({
+                    project_id: projectID,
+                    phase: "requested",
+                    attempt: 0,
+                    last_error: null,
+                    event_id: EventV2.ID.create(),
+                    event_delivered_at: null,
+                    created_at: now,
+                    updated_at: now,
+                  })
+                  .run()
+                const shares = yield* tx
+                  .select({
+                    sessionID: SessionShareTable.session_id,
+                    shareID: SessionShareTable.id,
+                    secret: SessionShareTable.secret,
+                    baseUrl: SessionShareTable.url,
+                  })
+                  .from(SessionShareTable)
+                  .innerJoin(SessionTable, eq(SessionTable.id, SessionShareTable.session_id))
+                  .where(eq(SessionTable.project_id, projectID))
+                  .all()
+                if (shares.length > 0)
+                  yield* tx
+                    .insert(ProjectDeletionShareTable)
+                    .values(
+                      shares.map((share) => ({
+                        project_id: projectID,
+                        session_id: share.sessionID,
+                        share_id: share.shareID,
+                        secret: share.secret,
+                        base_url: share.baseUrl,
+                        status: "pending" as const,
+                        attempt: 0,
+                        last_error: null,
+                        created_at: now,
+                        updated_at: now,
+                      })),
+                    )
+                    .run()
+                const workspaces = yield* tx
+                  .select({ path: WorkspaceTable.directory, branch: WorkspaceTable.branch })
+                  .from(WorkspaceTable)
+                  .where(eq(WorkspaceTable.project_id, projectID))
+                  .all()
+                const paths = [...project.sandboxes.map((path) => ({ path, branch: null })), ...workspaces]
+                  .filter((item): item is { path: string; branch: string | null } => item.path !== null)
+                  .filter((item, index, all) => all.findIndex((other) => other.path === item.path) === index)
+                if (paths.length > 0)
+                  yield* tx
+                    .insert(ProjectDeletionWorktreeTable)
+                    .values(
+                      paths.map((item) => ({
+                        project_id: projectID,
+                        canonical_path: item.path,
+                        branch: item.branch,
+                        attempt: 0,
+                        last_error: null,
+                        created_at: now,
+                        updated_at: now,
+                      })),
+                    )
+                    .run()
+                return "owner" as const
+              }),
+            { behavior: "immediate" },
+          ),
+        )
+        .pipe(
+          Effect.onExit((exit) =>
+            Exit.isSuccess(exit) && exit.value === "owner" ? Effect.void : releaseOwner(projectID),
+          ),
+          Effect.catchTag("SqlError", Effect.die),
+        ) as Effect.Effect<"owner" | "in_progress", NotFoundError | NotRemovableError>
     }
 
-    const beforeCleanup = yield* phase(projectID)
-    if (beforeCleanup?.phase === "quiescing") {
-      yield* awaitQuiescence(projectID)
-      yield* transition(projectID, "cleaning")
-    }
+    const recover: Interface["recover"] = Effect.fn("ProjectDeletionCoordinator.recover")(function* () {
+      if (!actions) return
+      const jobs = yield* db
+        .select({ projectID: ProjectDeletionJobTable.project_id, phase: ProjectDeletionJobTable.phase })
+        .from(ProjectDeletionJobTable)
+        .all()
+        .pipe(Effect.orDie)
+      for (const job of jobs) {
+        if (job.phase === "share_failed") continue
+        const projectID = ProjectV2.ID.make(job.projectID)
+        for (let attempt = 0; attempt < (options.recoveryAttempts ?? 3); attempt++) {
+          if (owners.has(projectID)) break
+          closing.add(projectID)
+          owners.set(projectID, Deferred.makeUnsafe<void>())
+          const outcome = yield* execute(projectID)
+          if (outcome.status !== "in_progress") break
+          if (attempt + 1 >= (options.recoveryAttempts ?? 3)) break
+          yield* Effect.sleep(options.recoveryDelay ?? `${2 ** attempt * 25} millis`)
+        }
+      }
+    })
 
-    const cleaning = yield* phase(projectID)
-    if (cleaning?.phase === "cleaning") {
-      yield* actions.cleanup(projectID)
-      yield* transition(projectID, "cleanup_complete")
-    }
-
-    const complete = yield* phase(projectID)
-    if (complete?.phase === "cleanup_complete") {
-      yield* actions.publish(projectID)
-      yield* transition(projectID, "published")
-    }
-    yield* finish(projectID)
-    return { status: "completed" } as const
-  })
-
-  const execute: Interface["execute"] = (projectID) =>
-    run(projectID).pipe(
-      Effect.catchCause((cause) =>
-        Effect.gen(function* () {
-          const current = yield* phase(projectID)
-          if (!current) return { status: "completed" } as const
-          yield* transition(projectID, current.phase, Cause.pretty(cause))
-          return { status: "in_progress", phase: current.phase } as const
-        }),
-      ),
-      Effect.ensuring(
-        Effect.sync(() => {
-          owners.delete(projectID)
-          closing.delete(projectID)
-        }),
-      ),
+    const prepareShutdown: Interface["prepareShutdown"] = Effect.fn("ProjectDeletionCoordinator.prepareShutdown")(
+      function* () {
+        admissionClosed = true
+        const pending = [...owners.values()]
+        if (pending.length === 0) return
+        yield* Effect.forEach(pending, Deferred.await, { discard: true }).pipe(
+          Effect.timeoutOrElse({
+            duration: options.shutdownTimeout ?? "30 seconds",
+            orElse: () =>
+              new DeletionBusyError({ message: "Project deletion could not reach a durable shutdown boundary" }),
+          }),
+        )
+      },
     )
 
-  const begin: Interface["begin"] = (projectID) => {
-    if (owners.has(projectID) || closing.has(projectID)) return Effect.succeed("in_progress" as const)
-    closing.add(projectID)
-    owners.add(projectID)
-    return db
-      .transaction(
-        (tx) =>
-          Effect.gen(function* () {
-            if (projectID === ProjectV2.ID.global) return yield* new NotRemovableError({ projectID })
-            const existing = yield* tx
-              .select({ phase: ProjectDeletionJobTable.phase })
-              .from(ProjectDeletionJobTable)
-              .where(eq(ProjectDeletionJobTable.project_id, projectID))
-              .get()
-            if (existing) return "in_progress" as const
-            const project = yield* tx.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get()
-            if (!project) return yield* new NotFoundError({ projectID })
-            const now = Date.now()
-            yield* tx
-              .insert(ProjectDeletionJobTable)
-              .values({ project_id: projectID, phase: "requested", attempt: 0, last_error: null, created_at: now, updated_at: now })
-              .run()
-            const shares = yield* tx
-              .select({
-                sessionID: SessionShareTable.session_id,
-                shareID: SessionShareTable.id,
-                secret: SessionShareTable.secret,
-                baseUrl: SessionShareTable.url,
-              })
-              .from(SessionShareTable)
-              .innerJoin(SessionTable, eq(SessionTable.id, SessionShareTable.session_id))
-              .where(eq(SessionTable.project_id, projectID))
-              .all()
-            if (shares.length > 0)
-              yield* tx
-                .insert(ProjectDeletionShareTable)
-                .values(
-                  shares.map((share) => ({
-                    project_id: projectID,
-                    session_id: share.sessionID,
-                    share_id: share.shareID,
-                    secret: share.secret,
-                    base_url: share.baseUrl,
-                    status: "pending" as const,
-                    attempt: 0,
-                    last_error: null,
-                    created_at: now,
-                    updated_at: now,
-                  })),
-                )
-                .run()
-            const workspaces = yield* tx
-              .select({ path: WorkspaceTable.directory, branch: WorkspaceTable.branch })
-              .from(WorkspaceTable)
-              .where(eq(WorkspaceTable.project_id, projectID))
-              .all()
-            const paths = [...project.sandboxes.map((path) => ({ path, branch: null })), ...workspaces]
-              .filter((item): item is { path: string; branch: string | null } => item.path !== null)
-              .filter((item, index, all) => all.findIndex((other) => other.path === item.path) === index)
-            if (paths.length > 0)
-              yield* tx
-                .insert(ProjectDeletionWorktreeTable)
-                .values(
-                  paths.map((item) => ({
-                    project_id: projectID,
-                    canonical_path: item.path,
-                    branch: item.branch,
-                    attempt: 0,
-                    last_error: null,
-                    created_at: now,
-                    updated_at: now,
-                  })),
-                )
-                .run()
-            return "owner" as const
-          }),
-        { behavior: "immediate" },
-      )
-      .pipe(
-        Effect.tap((result) =>
-          Effect.sync(() => {
-            if (result === "owner") return
-            owners.delete(projectID)
-            closing.delete(projectID)
-          }),
-        ),
-        Effect.tapError(() =>
-          Effect.sync(() => {
-            owners.delete(projectID)
-            closing.delete(projectID)
-          }),
-        ),
-        Effect.catchTag("SqlError", Effect.die),
-      ) as Effect.Effect<"owner" | "in_progress", NotFoundError | NotRemovableError>
-  }
-
-  const recover: Interface["recover"] = Effect.fn("ProjectDeletionCoordinator.recover")(function* () {
-    if (!actions) return
-    const jobs = yield* db
-      .select({ projectID: ProjectDeletionJobTable.project_id, phase: ProjectDeletionJobTable.phase })
-      .from(ProjectDeletionJobTable)
-      .all()
-      .pipe(Effect.orDie)
-    for (const job of jobs) {
-      if (job.phase === "share_failed") continue
-      const projectID = ProjectV2.ID.make(job.projectID)
-      if (owners.has(projectID)) continue
-      owners.add(projectID)
-      closing.add(projectID)
-      yield* execute(projectID).pipe(
-        Effect.catchCause((cause) => Effect.logError("project deletion recovery failed", { projectID, cause })),
-      )
-    }
-  })
-
-  const prepareShutdown: Interface["prepareShutdown"] = Effect.fn("ProjectDeletionCoordinator.prepareShutdown")(function* () {
-    admissionClosed = true
-    while (owners.size > 0) yield* Effect.sleep("10 millis")
-  })
-
-  return Service.of({
-    begin,
-    execute,
-    assertWritable,
-    awaitQuiescence,
-    recover,
-    prepareShutdown,
-    install(next) {
-      actions = next
-    },
-    lease,
-    ownerCount: () => Effect.sync(() => owners.size),
-  })
+    return Service.of({
+      begin,
+      execute,
+      assertWritable,
+      withMutation,
+      withLease,
+      awaitQuiescence,
+      recover,
+      prepareShutdown,
+      install(next) {
+        actions = next
+      },
+      ownerCount: () => Effect.sync(() => owners.size),
+    })
   })
 }
 

@@ -82,11 +82,7 @@ const layer = Layer.effect(
           }
         },
         catch: (cause) => cause,
-      }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("artifact removal failed during project delete", { target, cause }),
-        ),
-      )
+      })
 
     function parseWorktreeList(text: string) {
       const entries: { path?: string; branch?: string }[] = []
@@ -131,7 +127,7 @@ const layer = Layer.effect(
         yield* stopFsmonitor(entry.path)
         const removed = yield* git(["worktree", "remove", "--force", entry.path], info.worktree)
         if (removed.code !== 0)
-          yield* Effect.logWarning("git worktree remove failed during project delete", { path: entry.path })
+          return yield* Effect.fail(new Error(`git worktree remove failed for ${entry.path}: ${removed.stderr}`))
         yield* rmPath(entry.path)
       }
       // Prune stale admin entries for dirs already gone from disk.
@@ -149,17 +145,17 @@ const layer = Layer.effect(
         if (!entry.branch || remaining.has(normalize(entry.path))) continue
         const deleted = yield* git(["branch", "-D", entry.branch], info.worktree)
         if (deleted.code !== 0)
-          yield* Effect.logWarning("worktree branch delete failed during project delete", { branch: entry.branch })
+          return yield* Effect.fail(new Error(`worktree branch delete failed for ${entry.branch}: ${deleted.stderr}`))
       }
       yield* rmPath(root)
     })
 
-    const emitDeleted = (id: string) =>
+    const emitDeleted = (id: string, eventID: string) =>
       Effect.sync(() =>
         GlobalBus.emit("event", {
           directory: "global",
           project: id,
-          payload: { type: Project.Event.Deleted.type, properties: { id } },
+          payload: { id: eventID, type: Project.Event.Deleted.type, properties: { id } },
         }),
       )
 
@@ -181,54 +177,42 @@ const layer = Layer.effect(
         ids.length === 0
           ? { messages: [] as string[], parts: [] as string[] }
           : {
-              messages: (
-                yield* db
-                  .select({ id: MessageTable.id })
-                  .from(MessageTable)
-                  .where(inArray(MessageTable.session_id, ids))
-                  .all()
-                  .pipe(Effect.orDie)
-              ).map((entry) => entry.id),
-              parts: (
-                yield* db
-                  .select({ id: PartTable.id })
-                  .from(PartTable)
-                  .where(inArray(PartTable.session_id, ids))
-                  .all()
-                  .pipe(Effect.orDie)
-              ).map((entry) => entry.id),
+              messages: (yield* db
+                .select({ id: MessageTable.id })
+                .from(MessageTable)
+                .where(inArray(MessageTable.session_id, ids))
+                .all()
+                .pipe(Effect.orDie)).map((entry) => entry.id),
+              parts: (yield* db
+                .select({ id: PartTable.id })
+                .from(PartTable)
+                .where(inArray(PartTable.session_id, ids))
+                .all()
+                .pipe(Effect.orDie)).map((entry) => entry.id),
             }
 
       const directories = [
         ...new Set([
           info.worktree,
           ...info.sandboxes,
-          ...(
-            yield* db
-              .select({ directory: ProjectDirectoryTable.directory })
-              .from(ProjectDirectoryTable)
-              .where(eq(ProjectDirectoryTable.project_id, projectID))
-              .all()
-              .pipe(Effect.orDie)
-          ).map((entry) => entry.directory),
+          ...(yield* db
+            .select({ directory: ProjectDirectoryTable.directory })
+            .from(ProjectDirectoryTable)
+            .where(eq(ProjectDirectoryTable.project_id, projectID))
+            .all()
+            .pipe(Effect.orDie)).map((entry) => entry.directory),
         ]),
       ]
 
-      const workspaceIDs = (
-        yield* db.select({ id: WorkspaceTable.id }).from(WorkspaceTable).where(eq(WorkspaceTable.project_id, projectID)).all().pipe(Effect.orDie)
-      ).map((entry) => entry.id)
+      const workspaceIDs = (yield* db
+        .select({ id: WorkspaceTable.id })
+        .from(WorkspaceTable)
+        .where(eq(WorkspaceTable.project_id, projectID))
+        .all()
+        .pipe(Effect.orDie)).map((entry) => entry.id)
 
       // Workspaces stop sync fibers, dispose adapters, remove their sessions.
-      yield* Effect.forEach(
-        workspaceIDs,
-        (id) =>
-          workspace.remove(id).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("workspace removal failed during project delete", { projectID, workspaceID: id, cause }),
-            ),
-          ),
-        { discard: true },
-      )
+      yield* Effect.forEach(workspaceIDs, (id) => workspace.remove(id), { discard: true })
 
       // 3. Sessions not covered by a workspace: top-most within the project set;
       // Session.remove recurses children and cleans event rows.
@@ -241,10 +225,7 @@ const layer = Layer.effect(
       const remainingIDs = new Set(remaining.map((entry) => entry.id))
       yield* Effect.forEach(
         remaining.filter((entry) => !entry.parentID || !remainingIDs.has(entry.parentID)),
-        (entry) =>
-          session.remove(entry.id).pipe(
-            Effect.catchCause((cause) => Effect.logWarning("session removal failed during project delete", { projectID, cause })),
-          ),
+        (entry) => session.remove(entry.id),
         { discard: true },
       )
 
@@ -264,16 +245,23 @@ const layer = Layer.effect(
       yield* rmPath(path.join(Global.Path.data, "snapshot", info.id))
       yield* rmPath(path.join(Global.Path.data, "storage", "project", `${info.id}.json`))
       yield* rmPath(path.join(Global.Path.data, "storage", "session", info.id))
-      yield* Effect.forEach(ids, (sid) => rmPath(path.join(Global.Path.data, "storage", "session_diff", `${sid}.json`)), {
-        discard: true,
-      })
-      yield* Effect.forEach(legacyIDs.messages, (mid) => rmPath(path.join(Global.Path.data, "storage", "message", mid)), {
-        discard: true,
-      })
+      yield* Effect.forEach(
+        ids,
+        (sid) => rmPath(path.join(Global.Path.data, "storage", "session_diff", `${sid}.json`)),
+        {
+          discard: true,
+        },
+      )
+      yield* Effect.forEach(
+        legacyIDs.messages,
+        (mid) => rmPath(path.join(Global.Path.data, "storage", "message", mid)),
+        {
+          discard: true,
+        },
+      )
       yield* Effect.forEach(legacyIDs.parts, (pid) => rmPath(path.join(Global.Path.data, "storage", "part", pid)), {
         discard: true,
       })
-
     })
 
     const revokeShares = Effect.fn("ProjectRemoval.revokeShares")(function* (projectID: ProjectV2.ID) {
@@ -281,22 +269,22 @@ const layer = Layer.effect(
       if (!row) return yield* new Project.NotFoundError({ projectID })
       const info = Project.fromRow(row)
       const ctx = yield* instanceStore.load({ directory: info.worktree })
-      const ids = (
-        yield* db
-          .select({ id: SessionShareTable.session_id })
-          .from(SessionShareTable)
-          .innerJoin(SessionTable, eq(SessionTable.id, SessionShareTable.session_id))
-          .where(eq(SessionTable.project_id, projectID))
-          .all()
-          .pipe(Effect.orDie)
-      ).map((entry) => SessionID.make(entry.id))
+      const ids = (yield* db
+        .select({ id: SessionShareTable.session_id })
+        .from(SessionShareTable)
+        .innerJoin(SessionTable, eq(SessionTable.id, SessionShareTable.session_id))
+        .where(eq(SessionTable.project_id, projectID))
+        .all()
+        .pipe(Effect.orDie)).map((entry) => SessionID.make(entry.id))
       yield* Effect.forEach(
         ids,
         (id) =>
-          shareNext.remove(id).pipe(
-            Effect.provideService(InstanceRef, ctx),
-            Effect.retry({ times: 2, schedule: Schedule.spaced("200 millis") }),
-          ),
+          shareNext
+            .remove(id)
+            .pipe(
+              Effect.provideService(InstanceRef, ctx),
+              Effect.retry({ times: 2, schedule: Schedule.spaced("200 millis") }),
+            ),
         { discard: true },
       )
     })

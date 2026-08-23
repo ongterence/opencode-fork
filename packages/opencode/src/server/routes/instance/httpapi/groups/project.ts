@@ -2,7 +2,7 @@ import { Project } from "@/project/project"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
-import { ProjectNotFoundError } from "../errors"
+import { ProjectDeletionInProgressError, ProjectNotFoundError } from "../errors"
 import { Authorization } from "../middleware/authorization"
 import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
@@ -42,6 +42,7 @@ export const ProjectApi = HttpApi.make("project")
         HttpApiEndpoint.post("initGit", `${root}/git/init`, {
           query: WorkspaceRoutingQuery,
           success: described(Project.Info, "Project information after git initialization"),
+          error: ProjectDeletionInProgressError,
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "project.initGit",
@@ -54,7 +55,7 @@ export const ProjectApi = HttpApi.make("project")
           query: WorkspaceRoutingQuery,
           payload: UpdatePayload,
           success: described(Project.Info, "Updated project information"),
-          error: [HttpApiError.BadRequest, ProjectNotFoundError],
+          error: [HttpApiError.BadRequest, ProjectNotFoundError, ProjectDeletionInProgressError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "project.update",

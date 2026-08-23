@@ -56,6 +56,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import type { ProjectDeletingError } from "@/project/deletion-coordinator"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -101,10 +102,10 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | ProjectDeletingError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | ProjectDeletingError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
@@ -145,7 +146,11 @@ const layer = Layer.effect(
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
-        prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        prompt: (input: PromptInput) =>
+          prompt(input).pipe(
+            Effect.catchTag("ProjectDeletingError", () => Effect.interrupt),
+            Effect.catch(Effect.die),
+          ),
       } satisfies TaskPromptOps
     })
 
@@ -1049,30 +1054,31 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* sessions.assertWritable(input.sessionID)
-      const release = yield* sessions.lease(input.sessionID, () => state.cancel(input.sessionID))
-      return yield* Effect.gen(function* () {
-        yield* revert.cleanup(session)
-        const message = yield* createUserMessage(input)
-        yield* sessions.touch(input.sessionID)
+    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | ProjectDeletingError> =
+      Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput) {
+        const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+        return yield* sessions.withLease(
+          input.sessionID,
+          () => state.cancel(input.sessionID),
+          Effect.gen(function* () {
+            yield* revert.cleanup(session)
+            const message = yield* createUserMessage(input)
+            yield* sessions.touch(input.sessionID)
 
-        const permissions: PermissionV1.Rule[] = []
-        for (const [t, enabled] of Object.entries(input.tools ?? {})) {
-          permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
-        }
-        if (permissions.length > 0) {
-          session.permission = permissions
-          yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-        }
+            const permissions: PermissionV1.Rule[] = []
+            for (const [t, enabled] of Object.entries(input.tools ?? {})) {
+              permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
+            }
+            if (permissions.length > 0) {
+              session.permission = permissions
+              yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+            }
 
-        if (input.noReply === true) return message
-        return yield* loop({ sessionID: input.sessionID })
-      }).pipe(Effect.ensuring(release))
-    })
+            if (input.noReply === true) return message
+            return yield* loop({ sessionID: input.sessionID })
+          }),
+        )
+      })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)

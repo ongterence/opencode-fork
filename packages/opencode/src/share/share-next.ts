@@ -309,25 +309,29 @@ const layer = Layer.effect(
 
     const create = Effect.fn("ShareNext.create")(function* (sessionID: SessionID) {
       if (disabled) return { id: "", url: "", secret: "" }
-      yield* session.assertWritable(sessionID)
       yield* Effect.logInfo("creating share", { sessionID: sessionID })
-      const req = yield* request()
-      const result = yield* HttpClientRequest.post(`${req.baseUrl}${req.api.create}`).pipe(
-        HttpClientRequest.setHeaders(req.headers),
-        HttpClientRequest.bodyJson({ sessionID }),
-        Effect.flatMap((r) => httpOk.execute(r)),
-        Effect.flatMap(HttpClientResponse.schemaBodyJson(ShareSchema)),
+      const result = yield* session.withMutation(
+        sessionID,
+        Effect.gen(function* () {
+          const req = yield* request()
+          const result = yield* HttpClientRequest.post(`${req.baseUrl}${req.api.create}`).pipe(
+            HttpClientRequest.setHeaders(req.headers),
+            HttpClientRequest.bodyJson({ sessionID }),
+            Effect.flatMap((r) => httpOk.execute(r)),
+            Effect.flatMap(HttpClientResponse.schemaBodyJson(ShareSchema)),
+          )
+          yield* db
+            .insert(SessionShareTable)
+            .values({ session_id: sessionID, id: result.id, secret: result.secret, url: result.url })
+            .onConflictDoUpdate({
+              target: SessionShareTable.session_id,
+              set: { id: result.id, secret: result.secret, url: result.url },
+            })
+            .run()
+            .pipe(Effect.orDie)
+          return result
+        }),
       )
-      yield* session.assertWritable(sessionID)
-      yield* db
-        .insert(SessionShareTable)
-        .values({ session_id: sessionID, id: result.id, secret: result.secret, url: result.url })
-        .onConflictDoUpdate({
-          target: SessionShareTable.session_id,
-          set: { id: result.id, secret: result.secret, url: result.url },
-        })
-        .run()
-        .pipe(Effect.orDie)
       const s = yield* InstanceState.get(state)
       s.shared.set(sessionID, result)
       yield* full(sessionID).pipe(

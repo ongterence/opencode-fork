@@ -4,7 +4,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { ProjectNotFoundError } from "../errors"
+import { ProjectDeletionInProgressError, ProjectNotFoundError } from "../errors"
 import { markInstanceForReload } from "../lifecycle"
 
 export const projectHandlers = HttpApiBuilder.group(InstanceHttpApi, "project", (handlers) =>
@@ -22,7 +22,18 @@ export const projectHandlers = HttpApiBuilder.group(InstanceHttpApi, "project", 
 
     const initGit = Effect.fn("ProjectHttpApi.initGit")(function* () {
       const ctx = yield* InstanceState.context
-      const next = yield* svc.initGit({ directory: ctx.directory, project: ctx.project })
+      const next = yield* svc.initGit({ directory: ctx.directory, project: ctx.project }).pipe(
+        Effect.catchTag("ProjectDeletingError", (error) =>
+          Effect.fail(
+            new ProjectDeletionInProgressError({
+              projectID: error.projectID,
+              phase: error.phase,
+              code: "project_deletion_in_progress",
+              message: `Project deletion is in progress: ${error.projectID}`,
+            }),
+          ),
+        ),
+      )
       if (next.id === ctx.project.id && next.vcs === ctx.project.vcs && next.worktree === ctx.project.worktree)
         return next
       yield* markInstanceForReload(ctx, {
@@ -38,6 +49,16 @@ export const projectHandlers = HttpApiBuilder.group(InstanceHttpApi, "project", 
       payload: Project.UpdatePayload
     }) {
       return yield* svc.update({ ...ctx.payload, projectID: ctx.params.projectID }).pipe(
+        Effect.catchTag("ProjectDeletingError", (error) =>
+          Effect.fail(
+            new ProjectDeletionInProgressError({
+              projectID: error.projectID,
+              phase: error.phase,
+              code: "project_deletion_in_progress",
+              message: `Project deletion is in progress: ${error.projectID}`,
+            }),
+          ),
+        ),
         Effect.catchTag("Project.NotFoundError", (error) =>
           Effect.fail(
             new ProjectNotFoundError({

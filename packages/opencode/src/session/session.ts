@@ -44,7 +44,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
-import { ProjectDeletionCoordinator } from "@/project/deletion-coordinator"
+import { ProjectDeletionCoordinator, type ProjectDeletingError } from "@/project/deletion-coordinator"
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -424,8 +424,11 @@ export interface Interface {
     metadata?: typeof Metadata.Type
     permission?: PermissionV1.Ruleset
     workspaceID?: WorkspaceV2.ID
-  }) => Effect.Effect<Info>
-  readonly fork: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Info, NotFound>
+  }) => Effect.Effect<Info, ProjectDeletingError>
+  readonly fork: (input: {
+    sessionID: SessionID
+    messageID?: MessageID
+  }) => Effect.Effect<Info, NotFound | ProjectDeletingError>
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
   readonly get: (id: SessionID) => Effect.Effect<Info, NotFound>
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
@@ -447,6 +450,7 @@ export interface Interface {
   readonly setSummary: (input: { sessionID: SessionID; summary: Info["summary"] }) => Effect.Effect<void>
   readonly setShare: (input: { sessionID: SessionID; share: Info["share"] }) => Effect.Effect<void>
   readonly setWorkspace: (input: { sessionID: SessionID; workspaceID: Info["workspaceID"] }) => Effect.Effect<void>
+  readonly patchWritable: (sessionID: SessionID, patch: Patch) => Effect.Effect<void, NotFound | ProjectDeletingError>
   readonly diff: (sessionID: SessionID) => Effect.Effect<Snapshot.FileDiff[]>
   readonly messages: (input: { sessionID: SessionID; limit?: number }) => Effect.Effect<SessionV1.WithParts[], NotFound>
   readonly children: (parentID: SessionID) => Effect.Effect<Info[]>
@@ -472,11 +476,16 @@ export interface Interface {
     sessionID: SessionID,
     predicate: (msg: SessionV1.WithParts) => boolean,
   ) => Effect.Effect<Option.Option<SessionV1.WithParts>, NotFound>
-  readonly assertWritable: (sessionID: SessionID) => Effect.Effect<void>
-  readonly lease: (
+  readonly assertWritable: (sessionID: SessionID) => Effect.Effect<void, ProjectDeletingError>
+  readonly withMutation: <A, E, R>(
+    sessionID: SessionID,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | ProjectDeletingError, R>
+  readonly withLease: <A, E, R>(
     sessionID: SessionID,
     cancel: () => Effect.Effect<unknown, unknown>,
-  ) => Effect.Effect<Effect.Effect<void>>
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | ProjectDeletingError, R>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Session") {}
@@ -517,22 +526,30 @@ const layer: Layer.Layer<
         .get()
         .pipe(Effect.orDie)
       if (!row) return
-      yield* deletion.assertWritable(row.projectID).pipe(Effect.orDie)
+      yield* deletion.assertWritable(row.projectID)
     })
 
-    const lease = Effect.fn("Session.lease")(function* (
-      sessionID: SessionID,
-      cancel: () => Effect.Effect<unknown, unknown>,
-    ) {
-      const row = yield* db
+    const withMutation: Interface["withMutation"] = (sessionID, effect) =>
+      db
         .select({ projectID: SessionTable.project_id })
         .from(SessionTable)
         .where(eq(SessionTable.id, sessionID))
         .get()
-        .pipe(Effect.orDie)
-      if (!row) return Effect.void
-      return yield* deletion.lease(row.projectID, `session:${sessionID}`, cancel).pipe(Effect.orDie)
-    })
+        .pipe(
+          Effect.orDie,
+          Effect.flatMap((row) => (row ? deletion.withMutation(row.projectID, effect) : effect)),
+        )
+
+    const withLease: Interface["withLease"] = (sessionID, cancel, effect) =>
+      db
+        .select({ projectID: SessionTable.project_id })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, sessionID))
+        .get()
+        .pipe(
+          Effect.orDie,
+          Effect.flatMap((row) => (row ? deletion.withLease(row.projectID, cancel, effect) : effect)),
+        )
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -570,8 +587,10 @@ const layer: Layer.Layer<
       }
       yield* Effect.logInfo("created", result)
 
-      yield* deletion.assertWritable(result.projectID).pipe(Effect.orDie)
-      yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
+      yield* deletion.withMutation(
+        result.projectID,
+        events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result }),
+      )
 
       return result
     })
@@ -644,44 +663,50 @@ const layer: Layer.Layer<
 
     const remove: Interface["remove"] = Effect.fnUntraced(function* (sessionID: SessionID) {
       const session = yield* get(sessionID)
-      try {
-        // `remove` needs to work in all cases, such as broken sessions that
-        // run cleanup without instance state.
-        const hasInstance = yield* InstanceState.directory.pipe(
-          Effect.as(true),
-          Effect.catchCause(() => Effect.succeed(false)),
-        )
+      // `remove` needs to work in all cases, such as broken sessions that
+      // run cleanup without instance state.
+      const hasInstance = yield* InstanceState.directory.pipe(
+        Effect.as(true),
+        Effect.catchCause(() => Effect.succeed(false)),
+      )
 
-        if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
-        const kids = yield* children(sessionID)
-        for (const child of kids) {
-          yield* remove(child.id)
-        }
-
-        yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
-        yield* events.remove(sessionID)
-      } catch (error) {
-        yield* Effect.logError("failed to remove session", { sessionID, error })
+      if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
+      const kids = yield* children(sessionID)
+      for (const child of kids) {
+        yield* remove(child.id)
       }
+
+      yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
+      yield* events.remove(sessionID)
     })
 
     const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T> =>
-      Effect.gen(function* () {
-        yield* assertWritable(msg.sessionID)
-        yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: msg.sessionID, info: msg })
-        return msg
-      }).pipe(Effect.withSpan("Session.updateMessage"))
+      withMutation(
+        msg.sessionID,
+        Effect.gen(function* () {
+          yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: msg.sessionID, info: msg })
+          return msg
+        }),
+      ).pipe(
+        Effect.catchTag("ProjectDeletingError", () => Effect.interrupt),
+        Effect.withSpan("Session.updateMessage"),
+      )
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
-      Effect.gen(function* () {
-        yield* assertWritable(part.sessionID)
-        yield* events.publish(SessionV1.Event.PartUpdated, {
-          sessionID: part.sessionID,
-          part: structuredClone(part),
-          time: Date.now(),
-        })
-        return part
-      }).pipe(Effect.withSpan("Session.updatePart"))
+      withMutation(
+        part.sessionID,
+        Effect.gen(function* () {
+          yield* events.publish(SessionV1.Event.PartUpdated, {
+            sessionID: part.sessionID,
+            part: structuredClone(part),
+            time: Date.now(),
+          })
+          return part
+        }),
+      ).pipe(
+        Effect.catchTag("ProjectDeletingError", () => Effect.interrupt),
+        Effect.withSpan("Session.updatePart"),
+      )
 
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
       const row = yield* db
@@ -773,35 +798,43 @@ const layer: Layer.Layer<
     })
 
     const patch = (sessionID: SessionID, info: Patch) =>
-      Effect.gen(function* () {
-        yield* assertWritable(sessionID)
-        const current = yield* get(sessionID)
-        const next = {
-          ...current,
-          ...info,
-          time: info.time ? { ...current.time, ...info.time } : current.time,
-          share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
-          summary: info.summary === null ? undefined : (info.summary ?? current.summary),
-          revert: info.revert === null ? undefined : (info.revert ?? current.revert),
-          permission: info.permission === null ? undefined : (info.permission ?? current.permission),
-        } as Info
-        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
-      })
+      withMutation(
+        sessionID,
+        Effect.gen(function* () {
+          const current = yield* get(sessionID)
+          const next = {
+            ...current,
+            ...info,
+            time: info.time ? { ...current.time, ...info.time } : current.time,
+            share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
+            summary: info.summary === null ? undefined : (info.summary ?? current.summary),
+            revert: info.revert === null ? undefined : (info.revert ?? current.revert),
+            permission: info.permission === null ? undefined : (info.permission ?? current.permission),
+          } as Info
+          yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
+        }),
+      )
+
+    const settlePatch = <A>(effect: Effect.Effect<A, NotFound | ProjectDeletingError>) =>
+      effect.pipe(
+        Effect.catchTag("ProjectDeletingError", () => Effect.interrupt),
+        Effect.catchTag("NotFoundError", Effect.die),
+      )
 
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
-      yield* patch(sessionID, { time: { updated: Date.now() } }).pipe(Effect.orDie)
+      yield* settlePatch(patch(sessionID, { time: { updated: Date.now() } }))
     })
 
     const setTitle = Effect.fn("Session.setTitle")(function* (input: { sessionID: SessionID; title: string }) {
-      yield* patch(input.sessionID, { title: input.title }).pipe(Effect.orDie)
+      yield* settlePatch(patch(input.sessionID, { title: input.title }))
     })
 
     const setArchived = Effect.fn("Session.setArchived")(function* (input: { sessionID: SessionID; time?: number }) {
-      yield* patch(input.sessionID, { time: { archived: input.time } }).pipe(Effect.orDie)
+      yield* settlePatch(patch(input.sessionID, { time: { archived: input.time } }))
     })
 
     const setMetadata = Effect.fn("Session.setMetadata")(function* (input: typeof SetMetadataInput.Type) {
-      yield* patch(input.sessionID, { metadata: input.metadata, time: { updated: Date.now() } }).pipe(Effect.orDie)
+      yield* settlePatch(patch(input.sessionID, { metadata: input.metadata, time: { updated: Date.now() } }))
     })
 
     const setAgentModel = Effect.fn("Session.setAgentModel")(function* (input: {
@@ -810,20 +843,20 @@ const layer: Layer.Layer<
       model: NonNullable<Info["model"]>
       time: number
     }) {
-      yield* patch(input.sessionID, {
-        agent: input.agent,
-        model: input.model,
-        time: { updated: input.time },
-      }).pipe(Effect.orDie)
+      yield* settlePatch(
+        patch(input.sessionID, {
+          agent: input.agent,
+          model: input.model,
+          time: { updated: input.time },
+        }),
+      )
     })
 
     const setPermission = Effect.fn("Session.setPermission")(function* (input: {
       sessionID: SessionID
       permission: PermissionV1.Ruleset
     }) {
-      yield* patch(input.sessionID, { permission: [...input.permission], time: { updated: Date.now() } }).pipe(
-        Effect.orDie,
-      )
+      yield* settlePatch(patch(input.sessionID, { permission: [...input.permission], time: { updated: Date.now() } }))
     })
 
     const setRevert = Effect.fn("Session.setRevert")(function* (input: {
@@ -831,35 +864,35 @@ const layer: Layer.Layer<
       revert: Info["revert"]
       summary: Info["summary"]
     }) {
-      yield* patch(input.sessionID, {
-        summary: input.summary,
-        time: { updated: Date.now() },
-        revert: input.revert,
-      }).pipe(Effect.orDie)
+      yield* settlePatch(
+        patch(input.sessionID, {
+          summary: input.summary,
+          time: { updated: Date.now() },
+          revert: input.revert,
+        }),
+      )
     })
 
     const clearRevert = Effect.fn("Session.clearRevert")(function* (sessionID: SessionID) {
-      yield* patch(sessionID, { time: { updated: Date.now() }, revert: null }).pipe(Effect.orDie)
+      yield* settlePatch(patch(sessionID, { time: { updated: Date.now() }, revert: null }))
     })
 
     const setSummary = Effect.fn("Session.setSummary")(function* (input: {
       sessionID: SessionID
       summary: Info["summary"]
     }) {
-      yield* patch(input.sessionID, { time: { updated: Date.now() }, summary: input.summary }).pipe(Effect.orDie)
+      yield* settlePatch(patch(input.sessionID, { time: { updated: Date.now() }, summary: input.summary }))
     })
 
     const setShare = Effect.fn("Session.setShare")(function* (input: { sessionID: SessionID; share: Info["share"] }) {
-      yield* patch(input.sessionID, { share: input.share ?? null, time: { updated: Date.now() } }).pipe(Effect.orDie)
+      yield* settlePatch(patch(input.sessionID, { share: input.share ?? null, time: { updated: Date.now() } }))
     })
 
     const setWorkspace = Effect.fn("Session.setWorkspace")(function* (input: {
       sessionID: SessionID
       workspaceID: Info["workspaceID"]
     }) {
-      yield* patch(input.sessionID, { workspaceID: input.workspaceID, time: { updated: Date.now() } }).pipe(
-        Effect.orDie,
-      )
+      yield* settlePatch(patch(input.sessionID, { workspaceID: input.workspaceID, time: { updated: Date.now() } }))
     })
 
     const diff = Effect.fn("Session.diff")(function* (sessionID: SessionID) {
@@ -896,12 +929,16 @@ const layer: Layer.Layer<
       sessionID: SessionID
       messageID: MessageID
     }) {
-      yield* assertWritable(input.sessionID)
-      yield* events.publish(SessionV1.Event.MessageRemoved, {
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-      })
-      return input.messageID
+      return yield* withMutation(
+        input.sessionID,
+        Effect.gen(function* () {
+          yield* events.publish(SessionV1.Event.MessageRemoved, {
+            sessionID: input.sessionID,
+            messageID: input.messageID,
+          })
+          return input.messageID
+        }),
+      ).pipe(Effect.catchTag("ProjectDeletingError", () => Effect.interrupt))
     })
 
     const removePart = Effect.fn("Session.removePart")(function* (input: {
@@ -909,13 +946,17 @@ const layer: Layer.Layer<
       messageID: MessageID
       partID: PartID
     }) {
-      yield* assertWritable(input.sessionID)
-      yield* events.publish(SessionV1.Event.PartRemoved, {
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-        partID: input.partID,
-      })
-      return input.partID
+      return yield* withMutation(
+        input.sessionID,
+        Effect.gen(function* () {
+          yield* events.publish(SessionV1.Event.PartRemoved, {
+            sessionID: input.sessionID,
+            messageID: input.messageID,
+            partID: input.partID,
+          })
+          return input.partID
+        }),
+      ).pipe(Effect.catchTag("ProjectDeletingError", () => Effect.interrupt))
     })
 
     const updatePartDelta = Effect.fnUntraced(function* (input: {
@@ -925,8 +966,9 @@ const layer: Layer.Layer<
       field: string
       delta: string
     }) {
-      yield* assertWritable(input.sessionID)
-      yield* events.publish(MessageV2.Event.PartDelta, input)
+      yield* withMutation(input.sessionID, events.publish(MessageV2.Event.PartDelta, input)).pipe(
+        Effect.catchTag("ProjectDeletingError", () => Effect.interrupt),
+      )
     })
 
     /** Finds the first message matching the predicate, searching newest-first. */
@@ -965,6 +1007,7 @@ const layer: Layer.Layer<
       setSummary,
       setShare,
       setWorkspace,
+      patchWritable: patch,
       diff,
       messages,
       children,
@@ -977,7 +1020,8 @@ const layer: Layer.Layer<
       updatePartDelta,
       findMessage,
       assertWritable,
-      lease,
+      withMutation,
+      withLease,
     })
   }),
 )
