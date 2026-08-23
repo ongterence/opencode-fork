@@ -210,6 +210,7 @@ export type DeleteProjectClientResult = {
 export function cleanupDeletedProjectClientState(input: {
   project: DeleteProjectClientResult
   persisted: Array<{ worktree: string; expanded: boolean }>
+  catalog: Project[]
   owner?: Project
   removePersisted: (worktree: string) => void
   forgetProject: (worktree: string) => void
@@ -219,16 +220,20 @@ export function cleanupDeletedProjectClientState(input: {
     ? [input.owner.worktree, ...input.owner.sandboxes].filter(Boolean)
     : [input.project.worktree].filter(Boolean)
   const worktrees = new Set(
-    input.persisted.flatMap((project) =>
-      roots.some((root) => projectOwnsDirectory(root, project.worktree)) ? [project.worktree] : [],
-    ),
+    input.persisted.flatMap((project) => {
+      if (!roots.some((root) => projectOwnsDirectory(root, project.worktree))) return []
+      const owner = findProjectDirectoryOwner(input.catalog, project.worktree)
+      if (input.owner && owner?.id !== input.project.projectID) return []
+      if (!input.owner && owner) return []
+      return [project.worktree]
+    }),
   )
   for (const worktree of worktrees) {
     input.removePersisted(worktree)
     input.forgetProject(worktree)
   }
   if (input.project.projectID) input.removeCatalog(input.project.projectID)
-  return roots
+  return [...worktrees]
 }
 
 export function findStaleProjectRows(input: {
@@ -259,6 +264,13 @@ export function projectOwnsDirectory(root: string, directory: string) {
   if (owner.windows !== candidate.windows) return false
   if (owner.key === candidate.key) return true
   return candidate.key.startsWith(owner.key.endsWith("/") ? owner.key : owner.key + "/")
+}
+
+export function sameProjectDirectory(left: string, right: string) {
+  if (!left || !right) return false
+  const first = normalizeOwnershipPath(left)
+  const second = normalizeOwnershipPath(right)
+  return first.windows === second.windows && first.key === second.key
 }
 
 function normalizeOwnershipPath(value: string) {

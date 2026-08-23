@@ -25,12 +25,14 @@ import type { ServerApi } from "@/utils/server"
 type McpApi = ServerApi["mcp"]
 
 describe("deleted project reconciliation", () => {
-  test("cleans every persisted alias owned by one deleted catalog project", () => {
+  test("cleans target aliases without sweeping a nested independent project", () => {
     const calls: string[] = []
     const persisted = [
       { worktree: "/repo", expanded: true },
       { worktree: "/repo/packages/app", expanded: false },
       { worktree: "/tmp/repo-sandbox/packages/ui", expanded: true },
+      { worktree: "/repo/vendor/nested", expanded: true },
+      { worktree: "/repo/vendor/nested/src", expanded: true },
       { worktree: "/keep", expanded: true },
     ]
     const owner = {
@@ -39,11 +41,18 @@ describe("deleted project reconciliation", () => {
       sandboxes: ["/tmp/repo-sandbox"],
       time: { created: 1, updated: 1 },
     } satisfies Project
+    const nested = {
+      id: "project-2",
+      worktree: "/repo/vendor/nested",
+      sandboxes: [],
+      time: { created: 1, updated: 1 },
+    } satisfies Project
 
-    const roots = cleanupDeletedProjectClientState({
+    const removed = cleanupDeletedProjectClientState({
       project: { projectID: "project-1", worktree: "/repo" },
       persisted: [...persisted],
       owner,
+      catalog: [owner, nested],
       removePersisted(worktree) {
         calls.push("remove:" + worktree)
       },
@@ -64,7 +73,84 @@ describe("deleted project reconciliation", () => {
       "forget:/tmp/repo-sandbox/packages/ui",
       "catalog:project-1",
     ])
-    expect(roots).toEqual(["/repo", "/tmp/repo-sandbox"])
+    expect(removed).toEqual(["/repo", "/repo/packages/app", "/tmp/repo-sandbox/packages/ui"])
+  })
+
+  test("cleans a nested independent project and all of its aliases", () => {
+    const calls: string[] = []
+    const parent = {
+      id: "project-1",
+      worktree: "/repo",
+      sandboxes: [],
+      time: { created: 1, updated: 1 },
+    } satisfies Project
+    const owner = {
+      id: "project-2",
+      worktree: "/repo/vendor/nested",
+      sandboxes: [],
+      time: { created: 1, updated: 1 },
+    } satisfies Project
+
+    const removed = cleanupDeletedProjectClientState({
+      project: { projectID: "project-2", worktree: owner.worktree },
+      persisted: [
+        { worktree: "/repo", expanded: true },
+        { worktree: "/repo/vendor/nested", expanded: true },
+        { worktree: "/repo/vendor/nested/src", expanded: false },
+      ],
+      owner,
+      catalog: [parent, owner],
+      removePersisted(worktree) {
+        calls.push("remove:" + worktree)
+      },
+      forgetProject(worktree) {
+        calls.push("forget:" + worktree)
+      },
+      removeCatalog(projectID) {
+        calls.push("catalog:" + projectID)
+      },
+    })
+
+    expect(calls).toEqual([
+      "remove:/repo/vendor/nested",
+      "forget:/repo/vendor/nested",
+      "remove:/repo/vendor/nested/src",
+      "forget:/repo/vendor/nested/src",
+      "catalog:project-2",
+    ])
+    expect(removed).toEqual(["/repo/vendor/nested", "/repo/vendor/nested/src"])
+  })
+
+  test("stale cleanup leaves rows owned by a nested catalog project", () => {
+    const calls: string[] = []
+    const nested = {
+      id: "project-2",
+      worktree: "/deleted/nested",
+      sandboxes: [],
+      time: { created: 1, updated: 1 },
+    } satisfies Project
+
+    const removed = cleanupDeletedProjectClientState({
+      project: { projectID: "", worktree: "/deleted" },
+      persisted: [
+        { worktree: "/deleted", expanded: true },
+        { worktree: "/deleted/nested", expanded: true },
+        { worktree: "/deleted/nested/src", expanded: false },
+      ],
+      catalog: [nested],
+      removePersisted(worktree) {
+        calls.push("remove:" + worktree)
+      },
+      forgetProject(worktree) {
+        calls.push("forget:" + worktree)
+      },
+      removeCatalog(projectID) {
+        calls.push("catalog:" + projectID)
+      },
+    })
+
+    expect(calls).toEqual(["remove:/deleted", "forget:/deleted"])
+    expect(removed).toEqual(["/deleted"])
   })
 
   test("retains nested project and sandbox aliases during authoritative reconciliation", () => {

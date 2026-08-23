@@ -119,10 +119,12 @@ function createServerCtx(
   })
 
   function cleanupProject(project: DeleteProjectClientResult) {
-    const entry = sync.data.project.find((item) => item.id === project.projectID)
+    const catalog = [...sync.data.project]
+    const entry = catalog.find((item) => item.id === project.projectID)
     return cleanupDeletedProjectClientState({
       project,
       persisted: [...projects.list()],
+      catalog,
       owner: entry,
       // remove(), not close(): deletion must never land under Recently closed.
       removePersisted: projects.remove,

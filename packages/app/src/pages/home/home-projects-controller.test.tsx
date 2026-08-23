@@ -51,7 +51,7 @@ describe("home project deletion", () => {
     let selection: HomeProjectSelection = { server: serverKey, directory: "/repo/packages/app" }
     await completeProjectDelete({
       request: async () => {},
-      cleanup: () => ["/repo", "/tmp/repo-sandbox"],
+      cleanup: () => ["/repo", "/repo/packages/app"],
       project: { projectID: "project-1", worktree: "/repo" },
       serverKey,
       selection: () => selection,
@@ -61,5 +61,22 @@ describe("home project deletion", () => {
     })
 
     expect(selection).toEqual({ server: serverKey })
+  })
+
+  test("retains selection for a nested independent project under the deleted root", async () => {
+    const serverKey = ServerConnection.Key.make("server-1")
+    let selection: HomeProjectSelection = { server: serverKey, directory: "/repo/vendor/nested" }
+    await completeProjectDelete({
+      request: async () => {},
+      cleanup: () => ["/repo", "/repo/packages/app"],
+      project: { projectID: "project-1", worktree: "/repo" },
+      serverKey,
+      selection: () => selection,
+      setSelection(next) {
+        selection = next
+      },
+    })
+
+    expect(selection).toEqual({ server: serverKey, directory: "/repo/vendor/nested" })
   })
 })

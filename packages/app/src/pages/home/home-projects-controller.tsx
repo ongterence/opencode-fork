@@ -16,7 +16,7 @@ import { createEffect, createResource } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { HomeController } from "./home-controller"
 import type { HomeProjectSelection } from "@/context/layout"
-import { findProjectDirectoryOwner, projectOwnsDirectory } from "@/context/server-sync"
+import { findProjectDirectoryOwner, sameProjectDirectory } from "@/context/server-sync"
 
 type DeleteProjectClientResult = { worktree: string; projectID: string }
 
@@ -41,7 +41,7 @@ function resetDeletedProjectSelection(input: {
 }) {
   const selection = input.selection()
   if (selection.server !== input.serverKey) return
-  if (!input.roots.some((root) => projectOwnsDirectory(root, selection.directory ?? ""))) return
+  if (!input.roots.some((worktree) => sameProjectDirectory(worktree, selection.directory ?? ""))) return
   input.setSelection({ server: input.serverKey })
 }
 
