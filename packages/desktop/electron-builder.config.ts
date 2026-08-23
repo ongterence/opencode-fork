@@ -35,6 +35,11 @@ const channel = (() => {
   return "dev"
 })()
 
+// Fork builds repoint the prod update feed at their own GitHub releases via env,
+// so electron-updater checks the fork's channel instead of the official one.
+const publishOwner = process.env.OPENCODE_PUBLISH_OWNER ?? "anomalyco"
+const publishRepo = process.env.OPENCODE_PUBLISH_REPO ?? "opencode"
+
 const APP_IDS = {
   dev: "ai.opencode.desktop.dev",
   beta: "ai.opencode.desktop.beta",
@@ -149,7 +154,7 @@ function getConfig() {
         appId,
         productName: "OpenCode",
         protocols: { name: "OpenCode", schemes: ["opencode"] },
-        publish: { provider: "github", owner: "anomalyco", repo: "opencode", channel: "latest" },
+        publish: { provider: "github", owner: publishOwner, repo: publishRepo, channel: "latest" },
         deb: { fpm: [metainfoFpm(appId), legacyDesktopEntryFpm] },
         rpm: { packageName: "opencode", fpm: [metainfoFpm(appId), legacyDesktopEntryFpm] },
       }
