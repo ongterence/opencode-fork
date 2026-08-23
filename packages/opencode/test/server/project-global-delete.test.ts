@@ -896,6 +896,34 @@ describe("global project delete endpoint", () => {
   )
 
   it.instance(
+    "removes a project with a missing sandbox without probing git",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const missing = path.join(
+          deletionTarget({
+            pathApi: path,
+            dataRoot: Global.Path.data,
+            category: "worktree",
+            projectID: project.id,
+          }),
+          "already-gone",
+        )
+        const { db } = yield* Database.Service
+        yield* db.run(sql`UPDATE project SET sandboxes = ${JSON.stringify([missing])} WHERE id = ${project.id}`).pipe(Effect.orDie)
+
+        const removed = yield* request(`/global/project/${project.id}`, { method: "DELETE" })
+        expect(removed.status).toBe(204)
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, project.id)).get().pipe(Effect.orDie),
+        ).toBeUndefined()
+      }),
+    { git: true },
+  )
+
+  it.instance(
     "retains the journal when git cannot spawn the show-ref confirmation after branch deletion fails",
     () =>
       Effect.gen(function* () {

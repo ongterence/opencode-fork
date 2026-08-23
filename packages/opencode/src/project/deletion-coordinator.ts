@@ -20,6 +20,7 @@ import { and, eq, inArray, sql } from "drizzle-orm"
 import { Cause, Context, Deferred, Duration, Effect, Exit, Layer, Schema } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import * as Stream from "effect/Stream"
+import { statSync } from "node:fs"
 import path from "path"
 import { NotFoundError, NotRemovableError } from "./project-errors"
 import { ownedProjectWorktreeTarget } from "./removal-paths"
@@ -76,7 +77,7 @@ export type MakeOptions = {
   readonly recoveryAttempts?: number
   readonly recoveryDelay?: Duration.Input
   readonly afterPublish?: () => Effect.Effect<void, unknown>
-  readonly worktreeBranch?: (directory: string) => Effect.Effect<string | null>
+  readonly worktreeBranch?: (directory: string) => Effect.Effect<string | null, unknown>
 }
 
 export function make(options: MakeOptions = {}) {
@@ -605,6 +606,19 @@ const layer = Layer.effect(
     return yield* make({
       worktreeBranch: (directory) =>
         Effect.gen(function* () {
+          const exists = yield* Effect.try({
+            try: () => {
+              try {
+                statSync(directory)
+                return true
+              } catch (cause) {
+                if (isNotFound(cause)) return false
+                throw cause
+              }
+            },
+            catch: (cause) => cause,
+          })
+          if (!exists) return null
           const handle = yield* spawner.spawn(
             ChildProcess.make("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
               cwd: directory,
@@ -624,6 +638,10 @@ const layer = Layer.effect(
     })
   }),
 )
+
+function isNotFound(cause: unknown) {
+  return typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT"
+}
 
 export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, CrossSpawnSpawner.node] })
 
