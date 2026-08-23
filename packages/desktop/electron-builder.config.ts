@@ -29,6 +29,8 @@ async function signWindows(configuration: { path: string }) {
   )
 }
 
+async function stageUnsignedWindows() {}
+
 const channel = (() => {
   const raw = process.env.OPENCODE_CHANNEL
   if (raw === "dev" || raw === "beta" || raw === "prod") return raw
@@ -44,14 +46,12 @@ const publisherName = process.env.OPENCODE_WINDOWS_PUBLISHER_NAME
 
 if (forkUpdate) {
   if (process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true")
-    throw new Error("Fork packages may only be produced by the GitHub Actions Windows signing job")
-  const required = [
-    "AZURE_TRUSTED_SIGNING_ENDPOINT",
-    "AZURE_TRUSTED_SIGNING_ACCOUNT_NAME",
-    "AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE",
-    "OPENCODE_WINDOWS_PUBLISHER_NAME",
-    "OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT",
-  ]
+    throw new Error("Fork packages may only be produced by the GitHub Actions Windows workflow")
+  if (process.env.OPENCODE_FORK_PACKAGE_STAGE !== "unsigned")
+    throw new Error("Fork packaging must use the isolated unsigned artifact stage")
+  if (!process.env.GITHUB_WORKFLOW_REF?.includes("/.github/workflows/fork-update.yml@"))
+    throw new Error("Fork packaging is restricted to the immutable fork update workflow")
+  const required = ["OPENCODE_WINDOWS_PUBLISHER_NAME"]
   const missing = required.filter((name) => !process.env[name])
   if (missing.length) throw new Error(`Fork packaging requires signing identity variables: ${missing.join(", ")}`)
 }
@@ -113,9 +113,9 @@ const getBase = (appId: string): Configuration => ({
   },
   win: {
     icon: `resources/icons/icon.ico`,
-    publisherName: publisherName ? [publisherName] : undefined,
     signtoolOptions: {
-      sign: signWindows,
+      sign: forkUpdate ? stageUnsignedWindows : signWindows,
+      publisherName: publisherName ? [publisherName] : undefined,
     },
     target: ["nsis"],
     verifyUpdateCodeSignature: true,

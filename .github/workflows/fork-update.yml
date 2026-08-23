@@ -132,24 +132,16 @@ jobs:
     needs: source
     if: needs.source.outputs.publish == 'true'
     runs-on: windows-latest
-    environment: fork-update-signing
     timeout-minutes: 90
     permissions:
       contents: read
-      id-token: write
     env:
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
-      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
-      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE }}
       OPENCODE_WINDOWS_PUBLISHER_NAME: ${{ vars.OPENCODE_WINDOWS_PUBLISHER_NAME }}
-      OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
           ref: ${{ needs.source.outputs.source_sha }}
 
       - uses: ./.github/actions/setup-bun
@@ -157,13 +149,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-
-      - name: Azure login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
       - name: Prepare fork package
         working-directory: packages/desktop
@@ -176,7 +161,9 @@ jobs:
       - name: Validate source and package
         working-directory: packages/desktop
         timeout-minutes: 60
+        shell: bash
         run: |
+          set -euo pipefail
           bun test src/main/updater-controller.test.ts src/main/updater.test.ts
           bun typecheck
           bun run build
@@ -185,11 +172,14 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=4096
           OPENCODE_CHANNEL: prod
           OPENCODE_FORK_UPDATE: "true"
+          OPENCODE_FORK_PACKAGE_STAGE: unsigned
           OPENCODE_PUBLISH_OWNER: ${{ github.repository_owner }}
           OPENCODE_PUBLISH_REPO: ${{ github.event.repository.name }}
 
-      - name: Verify installer signature and update hash
+      - name: Verify unsigned package and update metadata
         shell: pwsh
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
         run: |
           $installers = @(Get-ChildItem "packages/desktop/dist/*.exe" -File)
           if ($installers.Count -ne 1) {
@@ -197,16 +187,21 @@ jobs:
           }
           $installer = $installers[0]
           $signature = Get-AuthenticodeSignature $installer.FullName
-          if ($signature.Status -ne "Valid") {
-            throw "Invalid installer signature: $($signature.Status)"
+          if ($signature.Status -ne "NotSigned") {
+            throw "Unsigned staging artifact has unexpected signature status: $($signature.Status)"
           }
-          $thumbprint = $signature.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant()
-          $approvedThumbprint = $env:OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
-          if ($thumbprint -ne $approvedThumbprint) {
-            throw "Installer certificate thumbprint is not approved"
+
+          $appUpdatePath = "packages/desktop/dist/win-unpacked/resources/app-update.yml"
+          if (-not (Test-Path $appUpdatePath)) {
+            throw "Packaged app-update.yml was not produced"
           }
-          if ($signature.SignerCertificate.Subject -ne $env:OPENCODE_WINDOWS_PUBLISHER_NAME) {
-            throw "Installer publisher does not match the approved identity"
+          $appUpdate = Get-Content $appUpdatePath -Raw
+          if ($appUpdate -notmatch "(?m)^publisherName:\s*$") {
+            throw "Packaged update configuration has no publisherName"
+          }
+          $publisherLine = "(?m)^\s*-\s*" + [regex]::Escape($env:OPENCODE_WINDOWS_PUBLISHER_NAME) + "\s*$"
+          if ($appUpdate -notmatch $publisherLine) {
+            throw "Packaged update configuration does not pin the approved publisher"
           }
 
           $metadataPath = "packages/desktop/dist/latest.yml"
@@ -217,6 +212,9 @@ jobs:
           $urlIndex = [Array]::FindIndex($lines, [Predicate[string]] { param($line) $line.Trim() -eq "- url: $($installer.Name)" })
           if ($urlIndex -lt 0) {
             throw "latest.yml does not name $($installer.Name)"
+          }
+          if ($lines[0].Trim() -ne "version: $env:VERSION") {
+            throw "latest.yml version does not match the immutable release version"
           }
           $shaLine = $lines[($urlIndex + 1)..([Math]::Min($urlIndex + 4, $lines.Count - 1))] |
             Where-Object { $_.Trim().StartsWith("sha512:") } |
@@ -236,25 +234,147 @@ jobs:
             throw "latest.yml SHA-512 does not match $($installer.Name)"
           }
 
-          Get-ChildItem "packages/desktop/dist" -File |
-            Where-Object { $_.Extension -in ".exe", ".blockmap" -or $_.Name -eq "latest.yml" } |
-            ForEach-Object { "$(Get-FileHash $_.FullName -Algorithm SHA512 | Select-Object -ExpandProperty Hash)  $($_.Name)" } |
-            Set-Content "packages/desktop/dist/SHA512SUMS.txt"
+          "$(Get-FileHash $installer.FullName -Algorithm SHA512 | Select-Object -ExpandProperty Hash)  $($installer.Name)" |
+            Set-Content "packages/desktop/dist/UNSIGNED-SHA512SUMS.txt"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: fork-update-${{ needs.source.outputs.version }}
+          name: fork-update-unsigned-${{ needs.source.outputs.version }}
           if-no-files-found: error
           path: |
             packages/desktop/dist/*.exe
-            packages/desktop/dist/*.blockmap
             packages/desktop/dist/latest.yml
-            packages/desktop/dist/SHA512SUMS.txt
+            packages/desktop/dist/UNSIGNED-SHA512SUMS.txt
+
+  sign:
+    needs:
+      - source
+      - validate
+    if: needs.source.outputs.publish == 'true'
+    runs-on: windows-latest
+    environment: fork-update-signing
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE }}
+      OPENCODE_WINDOWS_PUBLISHER_NAME: ${{ vars.OPENCODE_WINDOWS_PUBLISHER_NAME }}
+      OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: fork-update-unsigned-${{ needs.source.outputs.version }}
+          path: unsigned
+
+      - name: Verify immutable unsigned artifact
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem "unsigned/*.exe" -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one unsigned installer, found $($installers.Count)"
+          }
+          $manifest = (Get-Content "unsigned/UNSIGNED-SHA512SUMS.txt" -Raw).Trim().Split("  ", 2)
+          if ($manifest.Count -ne 2 -or $manifest[1] -ne $installers[0].Name) {
+            throw "Unsigned artifact manifest is invalid"
+          }
+          $actual = Get-FileHash $installers[0].FullName -Algorithm SHA512 | Select-Object -ExpandProperty Hash
+          if ($actual -ne $manifest[0]) {
+            throw "Unsigned artifact changed after validation"
+          }
+
+      - name: Azure login
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign installer
+        uses: azure/artifact-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16 # v1.2.0
+        with:
+          endpoint: ${{ env.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ env.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE }}
+          files: ${{ github.workspace }}\unsigned\opencode-desktop-win-x64.exe
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Verify signature and finalize update metadata
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.source.outputs.version }}
+        run: |
+          $installer = Get-Item "unsigned/opencode-desktop-win-x64.exe"
+          $signature = Get-AuthenticodeSignature $installer.FullName
+          if ($signature.Status -ne "Valid") {
+            throw "Invalid installer signature: $($signature.Status)"
+          }
+          $thumbprint = $signature.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant()
+          $approvedThumbprint = $env:OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+          if ($thumbprint -ne $approvedThumbprint) {
+            throw "Installer certificate thumbprint is not approved"
+          }
+          if ($signature.SignerCertificate.Subject -ne $env:OPENCODE_WINDOWS_PUBLISHER_NAME) {
+            throw "Installer publisher does not match the approved identity"
+          }
+
+          $sha512 = [System.Security.Cryptography.SHA512]::Create()
+          try {
+            $hash = [Convert]::ToBase64String($sha512.ComputeHash([IO.File]::ReadAllBytes($installer.FullName)))
+          }
+          finally {
+            $sha512.Dispose()
+          }
+          $size = $installer.Length
+          $shaCount = 0
+          $sizeCount = 0
+          $metadata = Get-Content "unsigned/latest.yml" | ForEach-Object {
+            if ($_.Trim().StartsWith("sha512:")) {
+              $shaCount++
+              return "$($_.Substring(0, $_.IndexOf('s')))sha512: $hash"
+            }
+            if ($_.Trim().StartsWith("size:")) {
+              $sizeCount++
+              return "$($_.Substring(0, $_.IndexOf('s')))size: $size"
+            }
+            $_
+          }
+          if ($shaCount -ne 2 -or $sizeCount -ne 1 -or $metadata[0].Trim() -ne "version: $env:VERSION") {
+            throw "latest.yml does not have the expected immutable NSIS metadata shape"
+          }
+          $metadata | Set-Content "unsigned/latest.yml"
+          Remove-Item "unsigned/UNSIGNED-SHA512SUMS.txt"
+          "$(Get-FileHash $installer.FullName -Algorithm SHA512 | Select-Object -ExpandProperty Hash)  $($installer.Name)" |
+            Set-Content "unsigned/SHA512SUMS.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fork-update-signed-${{ needs.source.outputs.version }}
+          if-no-files-found: error
+          path: |
+            unsigned/*.exe
+            unsigned/latest.yml
+            unsigned/SHA512SUMS.txt
 
   promote:
     needs:
       - source
-      - validate
+      - sign
     if: needs.source.outputs.publish == 'true'
     runs-on: windows-latest
     environment: fork-update-production
@@ -262,14 +382,13 @@ jobs:
     permissions:
       actions: read
       contents: write
+    env:
+      OPENCODE_WINDOWS_PUBLISHER_NAME: ${{ vars.OPENCODE_WINDOWS_PUBLISHER_NAME }}
+      OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: fork-update-${{ needs.source.outputs.version }}
+          name: fork-update-signed-${{ needs.source.outputs.version }}
           path: release-assets
 
       - name: Promote immutable release
@@ -282,11 +401,43 @@ jobs:
           REASON: ${{ needs.source.outputs.reason }}
         run: |
           $tag = "v$env:VERSION"
-          git fetch origin --tags
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to refresh remote tags"
+          $assets = @(Get-ChildItem "release-assets" -File)
+          $installers = @($assets | Where-Object { $_.Extension -eq ".exe" })
+          if ($assets.Count -ne 3 -or $installers.Count -ne 1) {
+            throw "Signed release artifact has an unexpected file set"
           }
-          $existingTag = git ls-remote --tags origin "refs/tags/$tag"
+          $installer = $installers[0]
+          $manifest = (Get-Content "release-assets/SHA512SUMS.txt" -Raw).Trim().Split("  ", 2)
+          $installerHash = Get-FileHash $installer.FullName -Algorithm SHA512 | Select-Object -ExpandProperty Hash
+          if ($manifest.Count -ne 2 -or $manifest[1] -ne $installer.Name -or $manifest[0] -ne $installerHash) {
+            throw "Signed artifact manifest does not match the installer"
+          }
+          $signature = Get-AuthenticodeSignature $installer.FullName
+          if ($signature.Status -ne "Valid") {
+            throw "Promoted installer signature is invalid: $($signature.Status)"
+          }
+          $thumbprint = $signature.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant()
+          $approvedThumbprint = $env:OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+          if ($thumbprint -ne $approvedThumbprint -or $signature.SignerCertificate.Subject -ne $env:OPENCODE_WINDOWS_PUBLISHER_NAME) {
+            throw "Promoted installer signing identity is not approved"
+          }
+          $metadata = Get-Content "release-assets/latest.yml"
+          if ($metadata[0].Trim() -ne "version: $env:VERSION") {
+            throw "Promoted update metadata has the wrong version"
+          }
+          $sha512 = [System.Security.Cryptography.SHA512]::Create()
+          try {
+            $metadataHash = [Convert]::ToBase64String($sha512.ComputeHash([IO.File]::ReadAllBytes($installer.FullName)))
+          }
+          finally {
+            $sha512.Dispose()
+          }
+          $metadataHashes = @($metadata | Where-Object { $_.Trim().StartsWith("sha512:") })
+          if ($metadataHashes.Count -ne 2 -or @($metadataHashes | Where-Object { $_.Trim() -ne "sha512: $metadataHash" }).Count -ne 0) {
+            throw "Promoted latest.yml SHA-512 does not match the signed installer"
+          }
+
+          $existingTag = git ls-remote --tags "https://github.com/$env:GITHUB_REPOSITORY.git" "refs/tags/$tag"
           if ($LASTEXITCODE -ne 0) {
             throw "Unable to inspect remote tag $tag"
           }
@@ -306,12 +457,9 @@ jobs:
           This immutable Windows fork release passed updater tests, type checking, build, Authenticode publisher/thumbprint verification, and latest.yml SHA-512 verification before promotion.
           "@
           $notes | Set-Content "$env:RUNNER_TEMP/release-notes.md"
-          $assets = @(Get-ChildItem "release-assets" -File | Select-Object -ExpandProperty FullName)
-          if ($assets.Count -lt 3) {
-            throw "Validated release assets are incomplete"
-          }
+          $releasePaths = @($assets | Select-Object -ExpandProperty FullName)
 
-          gh release create $tag @assets `
+          gh release create $tag @releasePaths `
             --repo $env:GITHUB_REPOSITORY `
             --target $env:SOURCE_SHA `
             --title "OpenCode $env:VERSION" `
