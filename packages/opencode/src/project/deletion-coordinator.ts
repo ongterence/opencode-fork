@@ -3,6 +3,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Git } from "@opencode-ai/core/git"
 import { Global } from "@opencode-ai/core/global"
 import {
   type DeletionPhase,
@@ -13,6 +14,7 @@ import {
 } from "@opencode-ai/core/project/deletion.sql"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { and, eq, inArray, sql } from "drizzle-orm"
@@ -73,6 +75,7 @@ export type MakeOptions = {
   readonly recoveryAttempts?: number
   readonly recoveryDelay?: Duration.Input
   readonly afterPublish?: () => Effect.Effect<void, unknown>
+  readonly worktreeBranch?: (directory: string) => Effect.Effect<string | null>
 }
 
 export function make(options: MakeOptions = {}) {
@@ -85,6 +88,7 @@ export function make(options: MakeOptions = {}) {
     const waiters = new Map<string, Deferred.Deferred<void>>()
     let actions: DeletionActions | undefined
     let admissionClosed = false
+    const worktreeBranch = options.worktreeBranch ?? (() => Effect.succeed(null))
 
     const phase = Effect.fnUntraced(function* (projectID: ProjectV2.ID) {
       return yield* db
@@ -465,11 +469,14 @@ export function make(options: MakeOptions = {}) {
                         }
                       })
                       .filter((item, index, all) => all.findIndex((other) => other.path === item.path) === index)
-                    if (paths.length > 0)
+                    const ownedWorktrees = yield* Effect.forEach(paths, (item) =>
+                      worktreeBranch(item.path).pipe(Effect.map((branch) => ({ ...item, branch }))),
+                    )
+                    if (ownedWorktrees.length > 0)
                       yield* tx
                         .insert(ProjectDeletionWorktreeTable)
                         .values(
-                          paths.map((item) => ({
+                          ownedWorktrees.map((item) => ({
                             project_id: projectID,
                             canonical_path: item.path,
                             branch: item.branch,
@@ -590,8 +597,21 @@ export function make(options: MakeOptions = {}) {
   })
 }
 
-const layer = Layer.effect(Service, make())
+const layer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const git = yield* Git.Service
+    return yield* make({
+      worktreeBranch: (directory) =>
+        Effect.gen(function* () {
+          const repo = yield* git.repo.discover(AbsolutePath.make(directory))
+          if (!repo) return null
+          return (yield* git.history.branch(repo)) ?? null
+        }),
+    })
+  }),
+)
 
-export const node = LayerNode.make({ service: Service, layer, deps: [Database.node] })
+export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, Git.node] })
 
 export * as ProjectDeletionCoordinator from "./deletion-coordinator"

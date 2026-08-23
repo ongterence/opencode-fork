@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm"
+import { eq } from "drizzle-orm"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import {
   ProjectDeletionArtifactTable,
@@ -51,7 +51,7 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ProjectRemoval") {}
 
-type GitResult = { code: number; text: string; stderr: string }
+type GitResult = { started: boolean; code: number; text: string; stderr: string }
 
 export class RequiredCleanupError extends Error {
   readonly code: "legacy_artifact_manual_reconciliation" | "required_cleanup_failed"
@@ -91,10 +91,17 @@ const layer = Layer.effect(
           [Stream.mkString(Stream.decodeText(handle.stdout)), Stream.mkString(Stream.decodeText(handle.stderr))],
           { concurrency: 2 },
         )
-        return { code: yield* handle.exitCode, text, stderr } satisfies GitResult
+        return { started: true, code: yield* handle.exitCode, text, stderr } satisfies GitResult
       },
       Effect.scoped,
-      Effect.catch(() => Effect.succeed({ code: 1, text: "", stderr: "" } satisfies GitResult)),
+      Effect.catch((cause) =>
+        Effect.succeed({
+          started: false,
+          code: -1,
+          text: "",
+          stderr: cause instanceof Error ? cause.message : String(cause),
+        } satisfies GitResult),
+      ),
     )
 
     // Mirrors Worktree.cleanDirectory: Windows file locks require many retries.
@@ -213,26 +220,9 @@ const layer = Layer.effect(
       const prepared = yield* Effect.forEach(owned, (entry) => {
         const listedEntry = listedByPath.get(identity(entry.canonical_path))
         const discoveredBranch = listedEntry?.branch?.replace(/^refs\/heads\//, "")
-        if (entry.branch && discoveredBranch && entry.branch !== discoveredBranch)
+        if (listedEntry && entry.branch !== discoveredBranch)
           return Effect.fail(new Error(`worktree branch changed for ${entry.canonical_path}`))
-        const branch = entry.branch ?? discoveredBranch ?? null
-        if (branch === entry.branch) return Effect.succeed({ ...entry, branch, listed: Boolean(listedEntry) })
-        return db
-          .transaction(
-            (tx) =>
-              tx
-                .update(ProjectDeletionWorktreeTable)
-                .set({ branch, updated_at: Date.now() })
-                .where(
-                  and(
-                    eq(ProjectDeletionWorktreeTable.project_id, projectID),
-                    eq(ProjectDeletionWorktreeTable.canonical_path, entry.canonical_path),
-                  ),
-                )
-                .run(),
-            { behavior: "immediate" },
-          )
-          .pipe(Effect.orDie, Effect.as({ ...entry, branch, listed: Boolean(listedEntry) }))
+        return Effect.succeed({ ...entry, listed: Boolean(listedEntry) })
       })
       for (const entry of prepared) {
         if (!entry.listed) {
@@ -291,7 +281,7 @@ const layer = Layer.effect(
         const deleted = yield* git(["branch", "-D", "--", entry.branch], info.worktree)
         if (deleted.code === 0) continue
         const present = yield* git(["show-ref", "--verify", "--quiet", `refs/heads/${entry.branch}`], info.worktree)
-        if (present.code === 1) continue
+        if (present.started && present.code === 1 && !present.text.trim() && !present.stderr.trim()) continue
         return yield* Effect.fail(new Error(`worktree branch delete failed for ${entry.branch}: ${deleted.stderr || deleted.text}`))
       }
     })

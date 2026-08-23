@@ -52,6 +52,7 @@ const it = testEffect(
   ),
 )
 
+
 function collectGlobalEvents() {
   return Effect.acquireRelease(
     Effect.sync(() => {
@@ -763,6 +764,141 @@ describe("global project delete endpoint", () => {
         expect(yield* db.select().from(ProjectDeletionWorktreeTable).all().pipe(Effect.orDie)).toEqual([])
         expect(yield* db.select().from(ProjectDeletionArtifactTable).all().pipe(Effect.orDie)).toEqual([])
         expect(events.seen.filter((event) => event.payload.type === "project.deleted")).toHaveLength(1)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "keeps a branch changed after deletion begin out of the cleanup journal",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const worktree = path.join(
+          deletionTarget({
+            pathApi: path,
+            dataRoot: Global.Path.data,
+            category: "worktree",
+            projectID: project.id,
+          }),
+          "branch-race",
+        )
+        const { db } = yield* Database.Service
+        yield* Effect.promise(() => $`git worktree add -b deletion-owner ${worktree}`.cwd(tmp.directory).quiet())
+        yield* db.run(sql`UPDATE project SET sandboxes = ${JSON.stringify([worktree])} WHERE id = ${project.id}`).pipe(Effect.orDie)
+
+        const coordinator = yield* ProjectDeletionCoordinator.Service
+        expect(yield* coordinator.begin(project.id)).toBe("owner")
+        expect(
+          (yield* db
+            .select({ branch: ProjectDeletionWorktreeTable.branch })
+            .from(ProjectDeletionWorktreeTable)
+            .where(eq(ProjectDeletionWorktreeTable.project_id, project.id))
+            .get()
+            .pipe(Effect.orDie))?.branch,
+        ).toBe("deletion-owner")
+        yield* Effect.promise(() => $`git checkout -b deletion-personal`.cwd(worktree).quiet())
+
+        expect(yield* coordinator.execute(project.id)).toEqual({ status: "in_progress", phase: "cleaning" })
+        expect(
+          (yield* db
+            .select({ error: ProjectDeletionJobTable.last_error })
+            .from(ProjectDeletionJobTable)
+            .where(eq(ProjectDeletionJobTable.project_id, project.id))
+            .get()
+            .pipe(Effect.orDie))?.error,
+        ).toContain("worktree branch changed")
+        expect((yield* Effect.promise(() => $`git show-ref --verify --quiet refs/heads/deletion-owner`.cwd(tmp.directory).quiet().nothrow())).exitCode).toBe(0)
+        expect((yield* Effect.promise(() => $`git show-ref --verify --quiet refs/heads/deletion-personal`.cwd(tmp.directory).quiet().nothrow())).exitCode).toBe(0)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "retains the journal when git cannot spawn the show-ref confirmation after branch deletion fails",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const fs = yield* FSUtil.Service
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const worktree = path.join(
+          deletionTarget({
+            pathApi: path,
+            dataRoot: Global.Path.data,
+            category: "worktree",
+            projectID: project.id,
+          }),
+          "spawn-sentinel",
+        )
+        const { db } = yield* Database.Service
+        yield* Effect.promise(() => $`git worktree add -b deletion-spawn-sentinel ${worktree}`.cwd(tmp.directory).quiet())
+        yield* db.run(sql`UPDATE project SET sandboxes = ${JSON.stringify([worktree])} WHERE id = ${project.id}`).pipe(Effect.orDie)
+        const real = path.join(process.env.ProgramFiles ?? "C:\\Program Files", "Git", "cmd", "git.exe")
+        const bin = path.join(tmp.directory, "git-spawn-sentinel")
+        yield* fs.ensureDir(bin)
+        yield* Effect.promise(() =>
+          Bun.write(
+            path.join(bin, "git.cmd"),
+            [
+              "@echo off",
+              'if "%~1"=="branch" (',
+              '  ren "%~f0" "git-disabled.cmd"',
+              "  echo fatal: simulated branch delete failure 1>&2",
+              "  exit /b 128",
+              ")",
+              `"${real}" %*`,
+            ].join("\r\n"),
+          ),
+        )
+        const coordinator = yield* ProjectDeletionCoordinator.Service
+        expect(yield* coordinator.begin(project.id)).toBe("owner")
+        const outcome = yield* Effect.acquireUseRelease(
+          Effect.sync(() => {
+            const previous = { PATH: process.env.PATH, Path: process.env.Path }
+            process.env.PATH = bin
+            process.env.Path = bin
+            return previous
+          }),
+          () => coordinator.execute(project.id),
+          (previous) =>
+            Effect.sync(() => {
+              if (previous.PATH === undefined) delete process.env.PATH
+              else process.env.PATH = previous.PATH
+              if (previous.Path === undefined) delete process.env.Path
+              else process.env.Path = previous.Path
+            }),
+        )
+
+        expect(outcome).toEqual({ status: "in_progress", phase: "cleaning" })
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, project.id)).get().pipe(Effect.orDie),
+        ).toBeDefined()
+        expect(
+          yield* db
+            .select()
+            .from(ProjectDeletionWorktreeTable)
+            .where(eq(ProjectDeletionWorktreeTable.project_id, project.id))
+            .get()
+            .pipe(Effect.orDie),
+        ).toBeDefined()
+        expect(
+          (yield* db
+            .select({ error: ProjectDeletionJobTable.last_error })
+            .from(ProjectDeletionJobTable)
+            .where(eq(ProjectDeletionJobTable.project_id, project.id))
+            .get()
+            .pipe(Effect.orDie))?.error,
+        ).toContain("spawn")
+        expect(
+          (yield* db
+            .select({ error: ProjectDeletionJobTable.last_error })
+            .from(ProjectDeletionJobTable)
+            .where(eq(ProjectDeletionJobTable.project_id, project.id))
+            .get()
+            .pipe(Effect.orDie))?.error,
+        ).toContain("worktree branch delete failed")
       }),
     { git: true },
   )
