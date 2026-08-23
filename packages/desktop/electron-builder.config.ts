@@ -43,6 +43,11 @@ const publishOwner = process.env.OPENCODE_PUBLISH_OWNER ?? "anomalyco"
 const publishRepo = process.env.OPENCODE_PUBLISH_REPO ?? "opencode"
 const forkUpdate = process.env.OPENCODE_FORK_UPDATE === "true"
 const publisherName = process.env.OPENCODE_WINDOWS_PUBLISHER_NAME
+const releaseChannel = channel === "beta" || channel === "prod"
+
+if (process.platform === "win32" && releaseChannel && process.env.GITHUB_ACTIONS === "true" && !publisherName) {
+  throw new Error("Release packaging requires OPENCODE_WINDOWS_PUBLISHER_NAME")
+}
 
 if (forkUpdate) {
   if (process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true")

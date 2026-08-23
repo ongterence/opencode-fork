@@ -229,6 +229,8 @@ jobs:
       AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
       AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE }}
       AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      OPENCODE_WINDOWS_PUBLISHER_NAME: ${{ vars.OPENCODE_WINDOWS_PUBLISHER_NAME }}
+      OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT }}
     strategy:
       fail-fast: false
       matrix:
@@ -378,15 +380,50 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:OPENCODE_WINDOWS_PUBLISHER_NAME)) {
+            throw "OPENCODE_WINDOWS_PUBLISHER_NAME must be configured for official Windows packaging"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT)) {
+            throw "OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT must be configured for official Windows packaging"
+          }
+
+          $appUpdateFiles = @(Get-ChildItem "${{ github.workspace }}\packages\desktop\dist\*unpacked\resources\app-update.yml" -File -ErrorAction SilentlyContinue)
+          if ($appUpdateFiles.Count -ne 1) {
+            throw "Expected exactly one packaged app-update.yml, found $($appUpdateFiles.Count)"
+          }
+          $appUpdatePath = $appUpdateFiles[0].FullName
+          $unpackedDirectory = Split-Path (Split-Path $appUpdatePath -Parent) -Parent
+          $appUpdate = Get-Content $appUpdatePath -Raw
+          if ($appUpdate -notmatch "(?m)^publisherName:\s*$") {
+            throw "Packaged update configuration has no publisherName"
+          }
+          $publisherLine = "(?m)^\s*-\s*" + [regex]::Escape($env:OPENCODE_WINDOWS_PUBLISHER_NAME) + "\s*$"
+          if ($appUpdate -notmatch $publisherLine) {
+            throw "Packaged update configuration does not pin the approved publisher"
+          }
+
           $files = @()
           $files += Get-ChildItem "${{ github.workspace }}\packages\desktop\dist\*.exe" | Select-Object -ExpandProperty FullName
-          $files += Get-ChildItem "${{ github.workspace }}\packages\desktop\dist\*unpacked\*.exe" | Select-Object -ExpandProperty FullName
-          $files += Get-ChildItem "${{ github.workspace }}\packages\desktop\dist\*unpacked\resources\opencode-cli.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          $files += Get-ChildItem "$unpackedDirectory\*.exe" | Select-Object -ExpandProperty FullName
+          $files += Get-ChildItem "$unpackedDirectory\resources\opencode-cli.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 
-          foreach ($file in $files | Select-Object -Unique) {
+          $files = @($files | Select-Object -Unique)
+          if ($files.Count -eq 0) {
+            throw "No Windows Electron artifacts were produced for signature verification"
+          }
+
+          $approvedThumbprint = $env:OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+          foreach ($file in $files) {
             $sig = Get-AuthenticodeSignature $file
             if ($sig.Status -ne "Valid") {
               throw "Invalid signature for ${file}: $($sig.Status)"
+            }
+            if ($sig.SignerCertificate.Subject -ne $env:OPENCODE_WINDOWS_PUBLISHER_NAME) {
+              throw "Windows artifact publisher does not match the approved identity: ${file}"
+            }
+            $thumbprint = $sig.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant()
+            if ($thumbprint -ne $approvedThumbprint) {
+              throw "Windows artifact certificate thumbprint is not approved: ${file}"
             }
           }
 
