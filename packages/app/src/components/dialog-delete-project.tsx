@@ -9,15 +9,18 @@ import { showToast } from "@/utils/toast"
 
 export type DeleteDialogState = "confirming" | "deleting" | "retryable_error"
 
-function retryable(error: unknown): error is { message?: unknown } {
-  if (!error || typeof error !== "object") return false
-  const value = error as { _tag?: unknown; code?: unknown; phase?: unknown; retry?: unknown }
-  return (
-    value._tag === "ProjectDeletionRetryableError" &&
-    value.code === "project_deletion_retryable" &&
-    value.phase === "share_failed" &&
-    value.retry === true
-  )
+type RetryableDeleteError = { message?: unknown }
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function extractRetryableDeleteError(error: unknown): RetryableDeleteError | undefined {
+  const cause = record(error) && record(error.cause) ? error.cause : undefined
+  const value = cause && "body" in cause ? cause.body : error
+  if (!record(value)) return
+  if (value.code !== "project_deletion_retryable" || value.phase !== "share_failed" || value.retry !== true) return
+  return value
 }
 
 export function createDeleteProjectDialogController(input: {
@@ -43,12 +46,13 @@ export function createDeleteProjectDialogController(input: {
     try {
       await (current === "retryable_error" ? input.retry() : input.remove())
     } catch (error) {
-      if (!retryable(error)) {
+      const retryable = extractRetryableDeleteError(error)
+      if (!retryable) {
         setState("confirming")
         input.onFailure(error)
         return
       }
-      setFailure(typeof error.message === "string" ? error.message : undefined)
+      setFailure(typeof retryable.message === "string" ? retryable.message : undefined)
       setState("retryable_error")
       input.focusRetry()
       return

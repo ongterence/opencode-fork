@@ -86,6 +86,35 @@ describe("delete project dialog", () => {
     expect(deleted).toBe(1)
   })
 
+  test("unwraps an SDK-wrapped retryable conflict", async () => {
+    let focused = 0
+    const controller = createController({
+      remove: async () => {
+        throw new Error("Project deletion is retryable", {
+          cause: {
+            body: {
+              code: "project_deletion_retryable",
+              phase: "share_failed",
+              retry: true,
+              message: "Remote share revocation is still required",
+            },
+          },
+        })
+      },
+      retry: async () => {},
+      onDeleted: () => {},
+      close: () => {},
+      focusRetry: () => focused++,
+      onFailure: () => {},
+    })
+    controller.setAcknowledgement("DELETE")
+
+    await controller.submit()
+    expect(controller.state()).toBe("retryable_error")
+    expect(controller.failure()).toBe("Remote share revocation is still required")
+    expect(focused).toBe(1)
+  })
+
   test("does not offer Retry for a conflict outside share_failed", async () => {
     let failed = 0
     let focused = 0
