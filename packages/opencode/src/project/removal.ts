@@ -1,5 +1,6 @@
-import { eq, inArray } from "drizzle-orm"
+import { eq } from "drizzle-orm"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
+import { ProjectDeletionArtifactTable, ProjectDeletionWorktreeTable } from "@opencode-ai/core/project/deletion.sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -9,7 +10,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
-import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Context, Effect, Layer, Schedule, Scope } from "effect"
@@ -27,6 +28,7 @@ import { InstanceStore } from "./instance-store"
 import * as Project from "./project"
 import { ProjectDeletingError, ProjectDeletionCoordinator } from "./deletion-coordinator"
 import { NotRemovableError } from "./project-errors"
+import { legacyDeletionTarget } from "./removal-paths"
 
 export { NotRemovableError } from "./project-errors"
 
@@ -110,13 +112,26 @@ const layer = Layer.effect(
       // path.join produces backslash separators.
       const normalize = (value: string) => value.toLowerCase().replaceAll("\\", "/")
       const root = normalize(path.join(Global.Path.data, "worktree", info.id))
+      const recorded = yield* db
+        .select({ path: ProjectDeletionWorktreeTable.canonical_path, branch: ProjectDeletionWorktreeTable.branch })
+        .from(ProjectDeletionWorktreeTable)
+        .where(eq(ProjectDeletionWorktreeTable.project_id, info.id))
+        .all()
+        .pipe(Effect.orDie)
+      const recordedBranches = new Map(recorded.map((entry) => [normalize(entry.path), entry.branch]))
       const listed = yield* git(["worktree", "list", "--porcelain"], info.worktree)
       const owned =
         listed.code !== 0
           ? []
           : parseWorktreeList(listed.text).flatMap((entry) =>
               entry.path && normalize(entry.path).startsWith(root)
-                ? [{ path: entry.path, branch: entry.branch?.replace(/^refs\/heads\//, "") }]
+                ? [
+                    {
+                      path: entry.path,
+                      branch:
+                        entry.branch?.replace(/^refs\/heads\//, "") ?? recordedBranches.get(normalize(entry.path)),
+                    },
+                  ]
                 : [],
             )
       if (owned.length === 0) {
@@ -158,7 +173,7 @@ const layer = Layer.effect(
         .where(eq(EventTable.id, eventID))
         .get()
         .pipe(Effect.orDie)
-      if (existing) return
+      if (existing) return yield* events.deliverProjectDeleted(id, eventID)
       yield* events.publish(
         Project.Event.Deleted,
         { id },
@@ -183,23 +198,12 @@ const layer = Layer.effect(
       const sessionIDs = new Set(sessions.map((entry) => entry.id))
       const ids = [...sessionIDs]
 
-      const legacyIDs =
-        ids.length === 0
-          ? { messages: [] as string[], parts: [] as string[] }
-          : {
-              messages: (yield* db
-                .select({ id: MessageTable.id })
-                .from(MessageTable)
-                .where(inArray(MessageTable.session_id, ids))
-                .all()
-                .pipe(Effect.orDie)).map((entry) => entry.id),
-              parts: (yield* db
-                .select({ id: PartTable.id })
-                .from(PartTable)
-                .where(inArray(PartTable.session_id, ids))
-                .all()
-                .pipe(Effect.orDie)).map((entry) => entry.id),
-            }
+      const artifacts = yield* db
+        .select({ kind: ProjectDeletionArtifactTable.kind, id: ProjectDeletionArtifactTable.artifact_id })
+        .from(ProjectDeletionArtifactTable)
+        .where(eq(ProjectDeletionArtifactTable.project_id, projectID))
+        .all()
+        .pipe(Effect.orDie)
 
       const directories = [
         ...new Set([
@@ -256,22 +260,25 @@ const layer = Layer.effect(
       yield* rmPath(path.join(Global.Path.data, "storage", "project", `${info.id}.json`))
       yield* rmPath(path.join(Global.Path.data, "storage", "session", info.id))
       yield* Effect.forEach(
-        ids,
-        (sid) => rmPath(path.join(Global.Path.data, "storage", "session_diff", `${sid}.json`)),
-        {
-          discard: true,
-        },
+        artifacts,
+        (artifact) =>
+          Effect.try({
+            try: () =>
+              legacyDeletionTarget({
+                pathApi: path,
+                dataRoot: Global.Path.data,
+                category:
+                  artifact.kind === "session_diff"
+                    ? "storage-session-diff"
+                    : artifact.kind === "message"
+                      ? "storage-message"
+                      : "storage-part",
+                relatedID: artifact.id,
+              }),
+            catch: (cause) => cause,
+          }).pipe(Effect.flatMap(rmPath)),
+        { discard: true },
       )
-      yield* Effect.forEach(
-        legacyIDs.messages,
-        (mid) => rmPath(path.join(Global.Path.data, "storage", "message", mid)),
-        {
-          discard: true,
-        },
-      )
-      yield* Effect.forEach(legacyIDs.parts, (pid) => rmPath(path.join(Global.Path.data, "storage", "part", pid)), {
-        discard: true,
-      })
 
       // 7. FK cascades sweep project_directory, permission, workspace, stragglers.
       yield* db.delete(ProjectTable).where(eq(ProjectTable.id, projectID)).run().pipe(Effect.orDie)

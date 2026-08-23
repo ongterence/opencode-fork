@@ -24,6 +24,14 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`project_deletion_artifact\` (
+          \`project_id\` text NOT NULL,
+          \`kind\` text NOT NULL,
+          \`artifact_id\` text NOT NULL,
+          CONSTRAINT \`project_deletion_artifact_pk\` PRIMARY KEY(\`project_id\`, \`kind\`, \`artifact_id\`)
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`project_deletion_job\` (
           \`project_id\` text PRIMARY KEY NOT NULL,
           \`phase\` text NOT NULL,

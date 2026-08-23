@@ -316,3 +316,111 @@ The two pre-existing custom-elements declaration files remain user-owned, unmodi
 - Making `Project.Event.Deleted` durable and adding it to the schema durable manifest is the only new support change outside the coordinator/admission files. It is necessary to use the repository's existing transactionally committed EventV2 outbox instead of treating volatile `GlobalBus` delivery as the durability boundary; no new database table or migration was added in this round.
 - EventV2 commit plus stable event-id suppression guarantees one durable deletion record and prevents recovery from re-bridging an already committed event. Raw in-process `GlobalBus` remains a volatile compatibility projection: a process crash after the SQLite commit but before an in-memory listener runs cannot provide exactly-once delivery to that dead process. Durable EventV2 replay is the authoritative no-loss recovery mechanism.
 - Task 4 continues to own historical share credential semantics. Task 5 continues to own the complete cleanup/path inventory rewrite; this round specifically prevents the current production cleanup from returning terminal success after a failed mandatory target.
+
+---
+
+## Fix round 3 — immutable artifact targets and committed-event replay
+
+### TDD red evidence
+
+The production retry test was expanded before the cleanup implementation. It creates a real session plus message/part rows, writes legacy session-diff/message/part artifacts, locks a real git worktree, and deletes through the production endpoint. From `packages/opencode`:
+
+```text
+$ bun test --timeout 30000 test/server/project-global-delete.test.ts -t "retries mandatory worktree cleanup"
+Expected: false
+Received: true
+0 pass
+1 fail
+8 expect() calls
+Ran 1 test across 1 file. [6.37s]
+```
+
+The failure was specifically the session-diff artifact remaining after unlock/recovery had already removed the project and journal. Message and part targets would have followed the same empty-live-row retry path.
+
+The committed-but-unbridged production recovery test was also red first:
+
+```text
+$ bun test --timeout 30000 test/server/project-global-delete.test.ts -t "replays a committed deletion event"
+Expected length: 1
+Received length: 0
+0 pass
+1 fail
+Ran 1 test across 1 file. [5.04s]
+```
+
+The core interlock test installed a crash after the EventTable transaction and before listener notification. Before the hook existed, publication succeeded and the test observed `Expected failure: true / Received: false` (`0 pass, 1 fail`). The migration test likewise failed first because `project_deletion_artifact` was absent from the durable journal schema.
+
+### Implemented corrections
+
+- Added `project_deletion_artifact(project_id, kind, artifact_id)` with a three-column primary key. The generated migration, migration registry, fresh schema, and schema snapshot are included.
+- The coordinator's immediate `begin` transaction now snapshots every project session id, legacy message id, and legacy part id before any workspace/session deletion. The rows are tagged `session_diff`, `message`, or `part`; they remain immutable across retries and are deleted only in terminal `finish` with the share/worktree/job journals.
+- Production cleanup reads only the durable artifact snapshot for live-derived legacy targets. Each identifier is passed through `legacyDeletionTarget`, so unsafe/corrupt legacy metadata retains the job in `cleaning` for retry/manual repair instead of constructing an unsafe path or reporting terminal success.
+- Production git cleanup now reads `ProjectDeletionWorktreeTable` and uses its recorded canonical paths/branches when reconciling the authoritative git worktree list. The journal remains present until terminal `finish`.
+- Added an EventV2 `afterDurableCommit` interlock used to prove the real transaction boundary: EventTable contains the event while listeners have received nothing.
+- `EventV2Bridge` now has an explicit durable `deliverProjectDeleted` replay path. It reconstructs the deletion and sync projections from EventTable, validates the versioned type/project payload, and deduplicates durable project-deletion IDs within the active process. Recovery therefore emits one terminal project-deleted event and one sync event when the prior process committed but never bridged, while recovery after an already bridged publish emits no duplicate.
+
+### Final green verification
+
+Core EventV2 and durable journal suites, from `packages/core`:
+
+```text
+$ bun test test/event.test.ts test/database/project-deletion-job.test.ts
+47 pass
+0 fail
+87 expect() calls
+Ran 47 tests across 2 files. [1.70s]
+```
+
+Coordinator and production global deletion, from `packages/opencode`:
+
+```text
+$ bun test --timeout 30000 test/project/deletion-coordinator.test.ts test/server/project-global-delete.test.ts
+17 pass
+0 fail
+91 expect() calls
+Ran 17 tests across 2 files. [12.91s]
+```
+
+The expanded production retry asserts the three exact durable artifact keys after the locked-worktree failure, then proves recovery removes the worktree root, project artifact, session-diff artifact, message directory, part directory, project row, and all deletion journals before one terminal notification. The committed-unbridged recovery test observes exactly one `project.deleted` and one `sync` projection with the stable durable event id.
+
+Prior lease/adapter/session/share behavior, from `packages/opencode`:
+
+```text
+$ bun test --timeout 30000 test/control-plane/workspace.test.ts test/session/session.test.ts test/share/share-next.test.ts test/event-manifest.test.ts test/project/removal-paths.test.ts
+58 pass
+1 skip
+0 fail
+301 expect() calls
+Ran 59 tests across 5 files. [33.99s]
+```
+
+Fresh package-local verification:
+
+```text
+# packages/core
+$ bun run typecheck
+$ tsgo --noEmit
+$ bun run migration --check
+No schema changes, nothing to migrate
+
+# packages/opencode
+$ bun run typecheck
+$ tsgo --noEmit
+
+# packages/schema
+$ bun run typecheck
+$ tsgo --noEmit
+```
+
+### Fix-round changed files and necessary deviations
+
+- Artifact schema/migration: `packages/core/src/project/deletion.sql.ts`, `packages/core/src/database/migration/20260823124644_20260823_project_deletion_artifact.ts`, `packages/core/src/database/migration.gen.ts`, `packages/core/src/database/schema.gen.ts`, `packages/core/schema.json`, and `packages/core/test/database/project-deletion-job.test.ts`.
+- Event crash interlock: `packages/core/src/event.ts`, `packages/core/test/event.test.ts`.
+- Coordinator/cleanup/replay: `packages/opencode/src/project/deletion-coordinator.ts`, `packages/opencode/src/project/removal.ts`, `packages/opencode/src/event-v2-bridge.ts`.
+- Production regressions: `packages/opencode/test/server/project-global-delete.test.ts`.
+
+The artifact table and EventV2 test interlock are narrowly necessary support beyond the original Task 3 file list. No Task 4 share-credential semantics or Task 5 general cleanup-layout rewrite was added. The two pre-existing custom-elements declaration files remain user-owned, unmodified, and excluded from the commit.
+
+### Residual delivery boundary
+
+EventTable is the authoritative no-loss record. After process death, the new process replays a committed-but-unbridged deletion exactly once into its fresh GlobalBus lifetime. Within one process, the stable event-id set suppresses recovery duplicates. As with any synchronous in-process EventEmitter, a machine/process crash after an individual subscriber callback but before a separate durable acknowledgement cannot prove globally exactly-once delivery to that dead process; those consumers no longer exist, and durable replay intentionally informs consumers attached to the restarted process.

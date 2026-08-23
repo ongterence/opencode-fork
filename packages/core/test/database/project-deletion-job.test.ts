@@ -4,6 +4,7 @@ import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import projectDeletionJobMigration from "@opencode-ai/core/database/migration/20260823_project_deletion_job"
 import projectDeletionDeliveryMigration from "@opencode-ai/core/database/migration/20260823_project_deletion_outbox"
+import projectDeletionArtifactMigration from "@opencode-ai/core/database/migration/20260823124644_20260823_project_deletion_artifact"
 import { Effect } from "effect"
 import { sql } from "drizzle-orm"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
@@ -24,12 +25,15 @@ describe("project deletion job migration", () => {
         yield* DatabaseMigration.applyOnly(db, [projectDeletionJobMigration])
         yield* DatabaseMigration.applyOnly(db, [projectDeletionJobMigration])
         yield* DatabaseMigration.applyOnly(db, [projectDeletionDeliveryMigration])
+        yield* DatabaseMigration.applyOnly(db, [projectDeletionArtifactMigration])
+        yield* DatabaseMigration.applyOnly(db, [projectDeletionArtifactMigration])
 
         expect(
           yield* db.all(
-            sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('project_deletion_job', 'project_deletion_share', 'project_deletion_worktree') ORDER BY name`,
+            sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('project_deletion_artifact', 'project_deletion_job', 'project_deletion_share', 'project_deletion_worktree') ORDER BY name`,
           ),
         ).toEqual([
+          { name: "project_deletion_artifact" },
           { name: "project_deletion_job" },
           { name: "project_deletion_share" },
           { name: "project_deletion_worktree" },
@@ -70,6 +74,15 @@ describe("project deletion job migration", () => {
           { name: "project_id", pk: 1 },
           { name: "canonical_path", pk: 2 },
         ])
+        expect(
+          yield* db.all(
+            sql`SELECT name, pk FROM pragma_table_info('project_deletion_artifact') WHERE pk > 0 ORDER BY pk`,
+          ),
+        ).toEqual([
+          { name: "project_id", pk: 1 },
+          { name: "kind", pk: 2 },
+          { name: "artifact_id", pk: 3 },
+        ])
       }),
     )
   })
@@ -82,9 +95,10 @@ describe("project deletion job migration", () => {
 
         expect(
           yield* db.all(
-            sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('project_deletion_job', 'project_deletion_share', 'project_deletion_worktree') ORDER BY name`,
+            sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('project_deletion_artifact', 'project_deletion_job', 'project_deletion_share', 'project_deletion_worktree') ORDER BY name`,
           ),
         ).toEqual([
+          { name: "project_deletion_artifact" },
           { name: "project_deletion_job" },
           { name: "project_deletion_share" },
           { name: "project_deletion_worktree" },

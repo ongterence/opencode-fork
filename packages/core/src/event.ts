@@ -165,6 +165,7 @@ export const allBounded = (events: Interface, capacity: number) =>
 
 export interface LayerOptions {
   readonly beforeAggregateRead?: (aggregateID: string) => Effect.Effect<void>
+  readonly afterDurableCommit?: (event: Payload) => Effect.Effect<void, unknown>
 }
 
 export const layerWith = (options?: LayerOptions) =>
@@ -386,6 +387,7 @@ export const layerWith = (options?: LayerOptions) =>
                   version: definition.durable.version,
                 },
               }
+              if (options?.afterDurableCommit) yield* options.afterDurableCommit(event as Payload).pipe(Effect.orDie)
               yield* notify(event as Payload, true)
               return event
             }

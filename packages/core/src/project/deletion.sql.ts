@@ -35,6 +35,12 @@ export type DeletionWorktree = {
   branch: string | null
 }
 
+export type DeletionArtifact = {
+  project_id: string
+  kind: "session_diff" | "message" | "part"
+  artifact_id: string
+}
+
 export const ProjectDeletionJobTable = sqliteTable(
   "project_deletion_job",
   {
@@ -82,4 +88,14 @@ export const ProjectDeletionWorktreeTable = sqliteTable(
     updated_at: integer().notNull(),
   },
   (table) => [primaryKey({ columns: [table.project_id, table.canonical_path] })],
+)
+
+export const ProjectDeletionArtifactTable = sqliteTable(
+  "project_deletion_artifact",
+  {
+    project_id: text().notNull(),
+    kind: text().$type<DeletionArtifact["kind"]>().notNull(),
+    artifact_id: text().notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.project_id, table.kind, table.artifact_id] })],
 )

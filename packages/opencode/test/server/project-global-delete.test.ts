@@ -6,14 +6,22 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
-import { ProjectDeletionJobTable, ProjectDeletionWorktreeTable } from "@opencode-ai/core/project/deletion.sql"
-import { EventTable } from "@opencode-ai/core/event/sql"
+import { ProjectV2 } from "@opencode-ai/core/project"
+import {
+  ProjectDeletionArtifactTable,
+  ProjectDeletionJobTable,
+  ProjectDeletionWorktreeTable,
+} from "@opencode-ai/core/project/deletion.sql"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { EventV2 } from "@opencode-ai/core/event"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { Effect, Layer } from "effect"
 import { eq } from "drizzle-orm"
 import path from "path"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
 import { Snapshot } from "../../src/snapshot"
 import { ProjectDeletionCoordinator } from "../../src/project/deletion-coordinator"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { resetDatabase } from "../fixture/db"
@@ -143,7 +151,7 @@ describe("global project delete endpoint", () => {
       Effect.gen(function* () {
         const tmp = yield* TestInstance
         const current = yield* requestInDirectory("/project/current", tmp.directory)
-        const project = (yield* current.json) as { id: string }
+        const project = (yield* current.json) as { id: ProjectV2.ID }
         const { db } = yield* Database.Service
         yield* db
           .insert(ProjectDeletionJobTable)
@@ -269,23 +277,65 @@ describe("global project delete endpoint", () => {
         const fs = yield* FSUtil.Service
         const current = yield* requestInDirectory("/project/current", tmp.directory)
         const project = (yield* current.json) as { id: string }
+        const created = yield* requestInDirectory("/session", tmp.directory, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        })
+        const session = (yield* created.json) as { id: SessionID }
+        const messageID = MessageID.make("msg_cleanup_snapshot")
+        const partID = PartID.make("prt_cleanup_snapshot")
         const root = path.join(Global.Path.data, "worktree", project.id)
         const worktree = path.join(root, "retry-locked")
         const artifact = path.join(Global.Path.data, "storage", "project", `${project.id}.json`)
+        const sessionDiffArtifact = path.join(Global.Path.data, "storage", "session_diff", `${session.id}.json`)
+        const messageArtifact = path.join(Global.Path.data, "storage", "message", messageID)
+        const partArtifact = path.join(Global.Path.data, "storage", "part", partID)
         yield* fs.ensureDir(root)
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(MessageTable)
+          .values({ id: messageID, session_id: session.id, time_created: 1, time_updated: 1, data: {} as never })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(PartTable)
+          .values({
+            id: partID,
+            message_id: messageID,
+            session_id: session.id,
+            time_created: 1,
+            time_updated: 1,
+            data: {} as never,
+          })
+          .run()
+          .pipe(Effect.orDie)
         yield* Effect.promise(() => $`git worktree add -b deletion-retry ${worktree}`.cwd(tmp.directory).quiet())
         yield* Effect.promise(() => $`git worktree lock ${worktree}`.cwd(tmp.directory).quiet())
-        yield* Effect.promise(() => Bun.write(artifact, "must be removed"))
+        yield* Effect.forEach(
+          [artifact, sessionDiffArtifact, path.join(messageArtifact, "data"), path.join(partArtifact, "data")],
+          (target) => Effect.promise(() => Bun.write(target, "must be removed")),
+          { discard: true },
+        )
 
         const events = yield* collectGlobalEvents()
         const first = yield* request(`/global/project/${project.id}`, { method: "DELETE" })
         expect(first.status).toBe(409)
-        const { db } = yield* Database.Service
         expect(
           (yield* db.select().from(ProjectTable).all().pipe(Effect.orDie)).some((row) => row.id === project.id),
         ).toBe(true)
         expect(yield* fs.exists(worktree)).toBe(true)
         expect(yield* fs.exists(artifact)).toBe(true)
+        expect(
+          (yield* db
+            .select({ kind: ProjectDeletionArtifactTable.kind, id: ProjectDeletionArtifactTable.artifact_id })
+            .from(ProjectDeletionArtifactTable)
+            .where(eq(ProjectDeletionArtifactTable.project_id, project.id))
+            .all()
+            .pipe(Effect.orDie))
+            .map((entry) => `${entry.kind}:${entry.id}`)
+            .sort(),
+        ).toEqual([`message:${messageID}`, `part:${partID}`, `session_diff:${session.id}`])
 
         yield* Effect.promise(() => $`git worktree unlock ${worktree}`.cwd(tmp.directory).quiet())
         const coordinator = yield* ProjectDeletionCoordinator.Service
@@ -296,9 +346,68 @@ describe("global project delete endpoint", () => {
         ).toBe(false)
         expect(yield* fs.exists(root)).toBe(false)
         expect(yield* fs.exists(artifact)).toBe(false)
+        expect(yield* fs.exists(sessionDiffArtifact)).toBe(false)
+        expect(yield* fs.exists(messageArtifact)).toBe(false)
+        expect(yield* fs.exists(partArtifact)).toBe(false)
         expect(yield* db.select().from(ProjectDeletionJobTable).all().pipe(Effect.orDie)).toEqual([])
         expect(yield* db.select().from(ProjectDeletionWorktreeTable).all().pipe(Effect.orDie)).toEqual([])
+        expect(yield* db.select().from(ProjectDeletionArtifactTable).all().pipe(Effect.orDie)).toEqual([])
         expect(events.seen.filter((event) => event.payload.type === "project.deleted")).toHaveLength(1)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "replays a committed deletion event that crashed before the global bridge",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const eventID = EventV2.ID.make("evt_project_deleted_unbridged")
+        const { db } = yield* Database.Service
+        yield* db.delete(ProjectTable).where(eq(ProjectTable.id, project.id)).run().pipe(Effect.orDie)
+        yield* db
+          .insert(EventSequenceTable)
+          .values({ aggregate_id: project.id, seq: 0, owner_id: null })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(EventTable)
+          .values({
+            id: eventID,
+            aggregate_id: project.id,
+            seq: 0,
+            type: "project.deleted.1",
+            data: { id: project.id },
+          })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .insert(ProjectDeletionJobTable)
+          .values({
+            project_id: project.id,
+            phase: "cleanup_complete",
+            attempt: 0,
+            last_error: null,
+            event_id: eventID,
+            event_delivered_at: null,
+            created_at: 1,
+            updated_at: 1,
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        const events = yield* collectGlobalEvents()
+        const coordinator = yield* ProjectDeletionCoordinator.Service
+        yield* coordinator.recover()
+
+        expect(
+          events.seen.filter((event) => event.payload.id === eventID && event.payload.type === "project.deleted"),
+        ).toHaveLength(1)
+        expect(
+          events.seen.filter((event) => event.payload.type === "sync" && event.payload.syncEvent?.id === eventID),
+        ).toHaveLength(1)
       }),
     { git: true },
   )

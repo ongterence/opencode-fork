@@ -5,6 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import {
   type DeletionPhase,
+  ProjectDeletionArtifactTable,
   ProjectDeletionJobTable,
   ProjectDeletionShareTable,
   ProjectDeletionWorktreeTable,
@@ -12,8 +13,8 @@ import {
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
-import { SessionTable } from "@opencode-ai/core/session/sql"
-import { eq, sql } from "drizzle-orm"
+import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { eq, inArray, sql } from "drizzle-orm"
 import { Cause, Context, Deferred, Duration, Effect, Exit, Layer, Schema } from "effect"
 import { NotFoundError, NotRemovableError } from "./project-errors"
 
@@ -130,6 +131,10 @@ export function make(options: MakeOptions = {}) {
               yield* tx
                 .delete(ProjectDeletionWorktreeTable)
                 .where(eq(ProjectDeletionWorktreeTable.project_id, projectID))
+                .run()
+              yield* tx
+                .delete(ProjectDeletionArtifactTable)
+                .where(eq(ProjectDeletionArtifactTable.project_id, projectID))
                 .run()
               yield* tx.delete(ProjectDeletionJobTable).where(eq(ProjectDeletionJobTable.project_id, projectID)).run()
             }),
@@ -406,6 +411,44 @@ export function make(options: MakeOptions = {}) {
                             last_error: null,
                             created_at: now,
                             updated_at: now,
+                          })),
+                        )
+                        .run()
+                    const sessions = yield* tx
+                      .select({ id: SessionTable.id })
+                      .from(SessionTable)
+                      .where(eq(SessionTable.project_id, projectID))
+                      .all()
+                    const sessionIDs = sessions.map((session) => session.id)
+                    const messages =
+                      sessionIDs.length === 0
+                        ? []
+                        : yield* tx
+                            .select({ id: MessageTable.id })
+                            .from(MessageTable)
+                            .where(inArray(MessageTable.session_id, sessionIDs))
+                            .all()
+                    const parts =
+                      sessionIDs.length === 0
+                        ? []
+                        : yield* tx
+                            .select({ id: PartTable.id })
+                            .from(PartTable)
+                            .where(inArray(PartTable.session_id, sessionIDs))
+                            .all()
+                    const artifacts = [
+                      ...sessionIDs.map((artifactID) => ({ kind: "session_diff" as const, artifactID })),
+                      ...messages.map(({ id: artifactID }) => ({ kind: "message" as const, artifactID })),
+                      ...parts.map(({ id: artifactID }) => ({ kind: "part" as const, artifactID })),
+                    ]
+                    if (artifacts.length > 0)
+                      yield* tx
+                        .insert(ProjectDeletionArtifactTable)
+                        .values(
+                          artifacts.map((artifact) => ({
+                            project_id: projectID,
+                            kind: artifact.kind,
+                            artifact_id: artifact.artifactID,
                           })),
                         )
                         .run()

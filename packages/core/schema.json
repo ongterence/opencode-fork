@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "7c6bf4bf-f333-4a84-9f7a-fd344359f27b",
+  "id": "170ff036-aa5b-47cb-9073-68f4d54104ce",
   "prevIds": [
-    "e17d0f9c-8fe6-4368-a646-cf0512e61e96"
+    "7c6bf4bf-f333-4a84-9f7a-fd344359f27b"
   ],
   "ddl": [
     {
@@ -12,6 +12,10 @@
     },
     {
       "name": "data_migration",
+      "entityType": "tables"
+    },
+    {
+      "name": "project_deletion_artifact",
       "entityType": "tables"
     },
     {
@@ -193,6 +197,36 @@
       "name": "time_completed",
       "entityType": "columns",
       "table": "data_migration"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_id",
+      "entityType": "columns",
+      "table": "project_deletion_artifact"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "project_deletion_artifact"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "artifact_id",
+      "entityType": "columns",
+      "table": "project_deletion_artifact"
     },
     {
       "type": "text",
@@ -1938,6 +1972,17 @@
       "name": "fk_session_share_session_id_session_id_fk",
       "entityType": "fks",
       "table": "session_share"
+    },
+    {
+      "columns": [
+        "project_id",
+        "kind",
+        "artifact_id"
+      ],
+      "nameExplicit": false,
+      "name": "project_deletion_artifact_pk",
+      "entityType": "pks",
+      "table": "project_deletion_artifact"
     },
     {
       "columns": [

@@ -484,6 +484,30 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("retains the durable event when delivery crashes after commit", () =>
+    Effect.gen(function* () {
+      const aggregateID = "after-commit-crash"
+      const eventLayer = EventV2.layerWith({
+        afterDurableCommit: () => Effect.die("crash before listener delivery"),
+      }).pipe(Layer.provide(LayerNode.compile(Database.node)))
+
+      yield* Effect.gen(function* () {
+        const events = yield* EventV2.Service
+        const { db } = yield* Database.Service
+        const received: EventV2.Payload[] = []
+        yield* events.listen((event) => Effect.sync(() => received.push(event)))
+
+        const exit = yield* events.publish(SyncMessage, { id: aggregateID, text: "committed" }).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(received).toEqual([])
+        expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toHaveLength(
+          1,
+        )
+      }).pipe(Effect.provide(Layer.merge(LayerNode.compile(Database.node), eventLayer)))
+    }),
+  )
+
   it.effect("coalesces durable aggregate wakes while draining every committed event", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
