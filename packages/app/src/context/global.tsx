@@ -5,7 +5,12 @@ import { createServerProjects, RECENTLY_CLOSED_DISPLAY_LIMIT, ServerConnection, 
 import { pathKey } from "@/utils/path-key"
 import { useServerHealth } from "@/utils/server-health"
 import { createServerSdkContext } from "./server-sdk"
-import { createServerSyncContext } from "./server-sync"
+import {
+  cleanupDeletedProjectClientState,
+  createServerSyncContext,
+  findStaleProjectRows,
+  type DeleteProjectClientResult,
+} from "./server-sync"
 import { getOwner } from "solid-js/web"
 import { QueryClient } from "@tanstack/solid-query"
 import type { ServerScope } from "@/utils/server-scope"
@@ -109,13 +114,32 @@ function createServerCtx(
   })
   const sdk = createServerSdkContext(conn, scope)
   const sync = createServerSyncContext(sdk, {
-    onProjectDeleted: (worktree) => {
-      if (!worktree) return
-      // remove(), not close(): deletion must never land under Recently closed.
-      projects.remove(worktree)
-      sync.forgetProject(worktree)
-    },
+    onProjectDeleted: cleanupProject,
+    onProjectsRefreshed: reconcileProjects,
   })
+
+  function cleanupProject(project: DeleteProjectClientResult) {
+    const entry = sync.data.project.find((item) => item.id === project.projectID)
+    const worktrees = new Set([project.worktree, ...(entry?.sandboxes ?? [])].filter(Boolean))
+    if (worktrees.size === 0) worktrees.add("")
+    for (const worktree of worktrees) {
+      cleanupDeletedProjectClientState({
+        project: { projectID: project.projectID, worktree },
+        // remove(), not close(): deletion must never land under Recently closed.
+        removePersisted: projects.remove,
+        forgetProject: sync.forgetProject,
+        removeCatalog: (projectID) => sync.set("project", (items) => items.filter((item) => item.id !== projectID)),
+      })
+    }
+  }
+
+  async function reconcileProjects() {
+    const stale = findStaleProjectRows({
+      persisted: projects.list(),
+      catalog: sync.data.project,
+    })
+    for (const project of stale) cleanupProject(project)
+  }
 
   function enrich(project: { worktree: string; expanded: boolean }) {
     const [childStore] = sync.child(project.worktree, { bootstrap: false })
@@ -151,6 +175,8 @@ function createServerCtx(
     queryClient,
     sdk,
     sync,
+    cleanupProject,
+    reconcileProjects,
     isLocal,
     projects: {
       ...projects,

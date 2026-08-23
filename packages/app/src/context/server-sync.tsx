@@ -202,9 +202,48 @@ function makeQueryOptionsApi(
 }
 export type QueryOptionsApi = ReturnType<typeof makeQueryOptionsApi>
 
+export type DeleteProjectClientResult = {
+  projectID: string
+  worktree: string
+}
+
+export function cleanupDeletedProjectClientState(input: {
+  project: DeleteProjectClientResult
+  removePersisted: (worktree: string) => void
+  forgetProject: (worktree: string) => void
+  removeCatalog: (projectID: string) => void
+}) {
+  if (input.project.worktree) {
+    input.removePersisted(input.project.worktree)
+    input.forgetProject(input.project.worktree)
+  }
+  if (input.project.projectID) input.removeCatalog(input.project.projectID)
+}
+
+export function findStaleProjectRows(input: {
+  persisted: Array<{ worktree: string; id?: string; expanded?: boolean }>
+  catalog: Project[]
+}) {
+  const ids = new Set(input.catalog.map((project) => project.id))
+  const directories = new Set(
+    input.catalog.flatMap((project) => [project.worktree, ...project.sandboxes].map(directoryKey)),
+  )
+  return input.persisted.flatMap((project) => {
+    const projectID = project.id ?? ""
+    if (projectID && ids.has(projectID)) return []
+    if (directories.has(directoryKey(project.worktree))) return []
+    return [{ projectID, worktree: project.worktree }]
+  })
+}
+
+type ServerSyncOptions = {
+  onProjectDeleted?: (project: DeleteProjectClientResult) => void
+  onProjectsRefreshed?: () => void | Promise<void>
+}
+
 export function createServerSyncContextInner(
   serverSDK: ServerSDK,
-  options?: { onProjectDeleted?: (worktree?: string) => void },
+  options?: ServerSyncOptions,
 ) {
   const language = useLanguage()
   const owner = getOwner()
@@ -315,6 +354,7 @@ export function createServerSyncContextInner(
   const setBootStore = ((...input: unknown[]) => {
     if (input[0] === "project" && Array.isArray(input[1])) {
       setProjects(input[1] as Project[])
+      void options?.onProjectsRefreshed?.()
       return input[1]
     }
     return (setGlobalStore as (...args: unknown[]) => unknown)(...input)
@@ -541,6 +581,7 @@ export function createServerSyncContextInner(
     sessionLoads.delete(key)
     sessionMeta.delete(key)
     clearProviderRev(serverSDK.scope, key)
+    while (children.pinned(key)) children.unpin(key)
     children.disposeDirectory(key)
   }
 
@@ -561,9 +602,9 @@ export function createServerSyncContextInner(
 
     if (directory === "global") {
       if (eventType === "project.deleted") {
-        const id = (event.properties as { id?: string }).id
-        const entry = globalStore.project.find((candidate) => candidate.id === id)
-        options?.onProjectDeleted?.(entry?.worktree)
+        const projectID = (event.properties as { id?: string }).id ?? ""
+        const entry = globalStore.project.find((candidate) => candidate.id === projectID)
+        options?.onProjectDeleted?.({ projectID, worktree: entry?.worktree ?? "" })
       }
       if (eventType === "server.connected" && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
         void activeSessionsQuery.refetch()
@@ -748,7 +789,7 @@ export function createServerSyncContextInner(
 
 export function createServerSyncContext(
   serverSDK: ServerSDK,
-  options?: { onProjectDeleted?: (worktree?: string) => void },
+  options?: ServerSyncOptions,
 ) {
   const inner = createServerSyncContextInner(serverSDK, options)
   return Object.assign(inner, {

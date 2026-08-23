@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
+import type { OpencodeClient, Project } from "@opencode-ai/sdk/v2/client"
 import type {
   McpListInput,
   McpResourceCatalogInput,
@@ -10,12 +10,70 @@ import type {
 import { QueryClient } from "@tanstack/solid-query"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./global-sync/eviction"
 import { estimateRootSessionTotal, loadRootSessions } from "./global-sync/session-load"
-import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses } from "./server-sync"
+import {
+  cleanupDeletedProjectClientState,
+  findStaleProjectRows,
+  loadActiveSessionsQuery,
+  loadMcpQuery,
+  loadMcpResourcesQuery,
+  seedActiveSessionStatuses,
+} from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
 
 type McpApi = ServerApi["mcp"]
+
+describe("deleted project reconciliation", () => {
+  test("cleans persisted, child, and catalog state idempotently without closing", () => {
+    const calls: string[] = []
+    const catalog = [{ id: "project-1", worktree: "/project" }]
+    const cleanup = () =>
+      cleanupDeletedProjectClientState({
+        project: { projectID: "project-1", worktree: "/project" },
+        removePersisted(worktree) {
+          calls.push("remove:" + worktree)
+        },
+        forgetProject(worktree) {
+          calls.push("forget:" + worktree)
+        },
+        removeCatalog(projectID) {
+          calls.push("catalog:" + projectID)
+          const index = catalog.findIndex((item) => item.id === projectID)
+          if (index !== -1) catalog.splice(index, 1)
+        },
+      })
+
+    cleanup()
+    cleanup()
+
+    expect(calls).toEqual([
+      "remove:/project",
+      "forget:/project",
+      "catalog:project-1",
+      "remove:/project",
+      "forget:/project",
+      "catalog:project-1",
+    ])
+    expect(catalog).toEqual([])
+  })
+
+  test("finds only persisted rows absent from the authoritative catalog", () => {
+    expect(
+      findStaleProjectRows({
+        persisted: [
+          { worktree: "/keep", expanded: true },
+          { id: "deleted", worktree: "/deleted", expanded: true },
+          { worktree: "/keep-sandbox", expanded: true },
+        ],
+        catalog: [
+          { id: "keep", worktree: "/keep", sandboxes: ["/keep-sandbox"], time: { created: 1, updated: 1 } },
+          { id: "other", worktree: "/other", sandboxes: [], time: { created: 1, updated: 1 } },
+        ] satisfies Project[],
+      }),
+    ).toEqual([{ projectID: "deleted", worktree: "/deleted" }])
+  })
+})
 
 describe("MCP queries", () => {
   test("loads current servers for the requested location", async () => {

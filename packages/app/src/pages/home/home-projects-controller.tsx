@@ -12,9 +12,37 @@ import { pathKey } from "@/utils/path-key"
 import { Persist, persisted } from "@/utils/persist"
 import { showToast } from "@/utils/toast"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
-import { createResource } from "solid-js"
+import { createEffect, createResource } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { HomeController } from "./home-controller"
+import type { HomeProjectSelection } from "@/context/layout"
+
+type DeleteProjectClientResult = { worktree: string; projectID: string }
+
+export async function completeProjectDelete(input: {
+  request: () => Promise<void>
+  cleanup: (project: DeleteProjectClientResult) => void
+  project: DeleteProjectClientResult
+  serverKey: ServerConnection.Key
+  selection: () => HomeProjectSelection
+  setSelection: (next: HomeProjectSelection) => void
+}) {
+  await input.request()
+  input.cleanup(input.project)
+  resetDeletedProjectSelection(input)
+}
+
+function resetDeletedProjectSelection(input: {
+  project: Pick<DeleteProjectClientResult, "worktree">
+  serverKey: ServerConnection.Key
+  selection: () => HomeProjectSelection
+  setSelection: (next: HomeProjectSelection) => void
+}) {
+  const selection = input.selection()
+  if (selection.server !== input.serverKey) return
+  if (pathKey(selection.directory ?? "") !== pathKey(input.project.worktree)) return
+  input.setSelection({ server: input.serverKey })
+}
 
 export function createHomeProjectsController(home: HomeController) {
   const platform = usePlatform()
@@ -40,6 +68,18 @@ export function createHomeProjectsController(home: HomeController) {
   function canRevealProject(conn: ServerConnection.Any) {
     return platform.platform === "desktop" && !!platform.openPath && ServerConnection.local(conn)
   }
+
+  createEffect(() => {
+    const selection = home.selection.value()
+    const directory = selection.directory
+    if (!directory) return
+    const conn = home.server.list().find((candidate) => ServerConnection.key(candidate) === selection.server)
+    if (!conn) return
+    const ctx = home.server.context(conn)
+    if (!ctx.sync.data.ready) return
+    if (ctx.projects.list().some((project) => pathKey(project.worktree) === pathKey(directory))) return
+    home.selection.set({ server: selection.server })
+  })
 
   return {
     copy: {
@@ -119,7 +159,13 @@ export function createHomeProjectsController(home: HomeController) {
             (candidate) => pathKey(candidate.worktree) === pathKey(project.worktree),
           )
           if (known) return
-          ctx.projects.remove(project.worktree)
+          ctx.cleanupProject({ projectID: "", worktree: project.worktree })
+          resetDeletedProjectSelection({
+            project,
+            serverKey: ServerConnection.key(conn),
+            selection: home.selection.value,
+            setSelection: home.selection.set,
+          })
           return
         }
         void import("@/components/dialog-delete-project").then(({ DialogDeleteProject }) => {
@@ -127,16 +173,18 @@ export function createHomeProjectsController(home: HomeController) {
             <DialogDeleteProject
               name={project.name ?? project.worktree}
               remove={async () => {
-                await ctx.sdk.client.global.project.delete({ projectID })
+                await completeProjectDelete({
+                  request: async () => {
+                    await ctx.sdk.client.global.project.delete({ projectID })
+                  },
+                  cleanup: ctx.cleanupProject,
+                  project: { projectID, worktree: project.worktree },
+                  serverKey: ServerConnection.key(conn),
+                  selection: home.selection.value,
+                  setSelection: home.selection.set,
+                })
               }}
-              onDeleted={() => {
-                // remove(), not close(): deletion must never land under Recently closed.
-                ctx.projects.remove(project.worktree)
-                const selection = home.selection.value()
-                if (selection.server === ServerConnection.key(conn) && selection.directory === project.worktree) {
-                  home.selection.set({ server: ServerConnection.key(conn) })
-                }
-              }}
+              onDeleted={() => {}}
             />
           ))
         })

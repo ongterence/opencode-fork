@@ -105,16 +105,18 @@ describe("applyGlobalEvent", () => {
     expect(refreshCount).toBe(0)
   })
 
-  test("project.deleted splices the catalog entry", () => {
+  test("project.deleted splices the catalog entry once when replayed", () => {
     const project = [{ id: "p1" }, { id: "p2" }] as Project[]
-    applyGlobalEvent({
+    const input: Parameters<typeof applyGlobalEvent>[0] = {
       event: { type: "project.deleted", properties: { id: "p1" } },
       project,
       refresh: () => {},
       setGlobalProject(next) {
         if (typeof next === "function") next(project)
       },
-    })
+    }
+    applyGlobalEvent(input)
+    applyGlobalEvent(input)
 
     expect(project.map((x) => x.id)).toEqual(["p2"])
   })
