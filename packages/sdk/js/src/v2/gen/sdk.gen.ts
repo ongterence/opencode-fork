@@ -88,6 +88,8 @@ import type {
   GlobalHealthResponses,
   GlobalProjectDeleteErrors,
   GlobalProjectDeleteResponses,
+  GlobalProjectDeleteRetryErrors,
+  GlobalProjectDeleteRetryResponses,
   GlobalUpgradeErrors,
   GlobalUpgradeResponses,
   InstanceDisposeErrors,
@@ -1317,6 +1319,31 @@ export class Config extends HeyApiClient {
   }
 }
 
+export class Delete extends HeyApiClient {
+  /**
+   * Retry failed project deletion share revocation
+   *
+   * Retries a project deletion only after a retained remote share revocation failure.
+   */
+  public retry<ThrowOnError extends boolean = false>(
+    parameters: {
+      projectID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "projectID" }] }])
+    return (options?.client ?? this.client).post<
+      GlobalProjectDeleteRetryResponses,
+      GlobalProjectDeleteRetryErrors,
+      ThrowOnError
+    >({
+      url: "/global/project/{projectID}/delete/retry",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Project extends HeyApiClient {
   /**
    * Delete a project
@@ -1339,6 +1366,11 @@ export class Project extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  private _delete?: Delete
+  get delete2(): Delete {
+    return (this._delete ??= new Delete({ client: this.client }))
   }
 }
 

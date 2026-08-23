@@ -1644,6 +1644,7 @@ export type GlobalEvent = {
     | SyncEventSessionNextRevertStaged
     | SyncEventSessionNextRevertCleared
     | SyncEventSessionNextRevertCommitted
+    | SyncEventProjectDeleted
 }
 
 /**
@@ -2046,6 +2047,23 @@ export type ProjectNotFoundError = {
 export type ProjectNotRemovableError = {
   _tag: "ProjectNotRemovableError"
   projectID: string
+  message: string
+}
+
+export type ProjectDeletionInProgressError = {
+  _tag: "ProjectDeletionInProgressError"
+  projectID: string
+  phase: string
+  code: "project_deletion_in_progress"
+  message: string
+}
+
+export type ProjectDeletionRetryableError = {
+  _tag: "ProjectDeletionRetryableError"
+  projectID: string
+  phase: "share_failed"
+  code: "project_deletion_retryable"
+  retry: true
   message: string
 }
 
@@ -3834,6 +3852,20 @@ export type SyncEventSessionNextRevertCommitted = {
       timestamp: number
       sessionID: string
       messageID: string
+    }
+  }
+}
+
+export type SyncEventProjectDeleted = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "project.deleted.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      id: string
     }
   }
 }
@@ -7444,6 +7476,10 @@ export type GlobalProjectDeleteErrors = {
    * ProjectNotFoundError
    */
   404: ProjectNotFoundError
+  /**
+   * ProjectDeletionInProgressError | ProjectDeletionRetryableError
+   */
+  409: ProjectDeletionInProgressError | ProjectDeletionRetryableError
 }
 
 export type GlobalProjectDeleteError = GlobalProjectDeleteErrors[keyof GlobalProjectDeleteErrors]
@@ -7456,6 +7492,42 @@ export type GlobalProjectDeleteResponses = {
 }
 
 export type GlobalProjectDeleteResponse = GlobalProjectDeleteResponses[keyof GlobalProjectDeleteResponses]
+
+export type GlobalProjectDeleteRetryData = {
+  body?: never
+  path: {
+    projectID: string
+  }
+  query?: never
+  url: "/global/project/{projectID}/delete/retry"
+}
+
+export type GlobalProjectDeleteRetryErrors = {
+  /**
+   * ProjectNotRemovableError | InvalidRequestError
+   */
+  400: ProjectNotRemovableError | InvalidRequestError
+  /**
+   * ProjectNotFoundError
+   */
+  404: ProjectNotFoundError
+  /**
+   * ProjectDeletionInProgressError | ProjectDeletionRetryableError
+   */
+  409: ProjectDeletionInProgressError | ProjectDeletionRetryableError
+}
+
+export type GlobalProjectDeleteRetryError = GlobalProjectDeleteRetryErrors[keyof GlobalProjectDeleteRetryErrors]
+
+export type GlobalProjectDeleteRetryResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type GlobalProjectDeleteRetryResponse =
+  GlobalProjectDeleteRetryResponses[keyof GlobalProjectDeleteRetryResponses]
 
 export type EventSubscribeData = {
   body?: never
@@ -8844,6 +8916,10 @@ export type ProjectInitGitErrors = {
    * Bad request
    */
   400: BadRequestError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type ProjectInitGitError = ProjectInitGitErrors[keyof ProjectInitGitErrors]
@@ -8882,6 +8958,10 @@ export type ProjectUpdateErrors = {
    * ProjectNotFoundError
    */
   404: ProjectNotFoundError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type ProjectUpdateError = ProjectUpdateErrors[keyof ProjectUpdateErrors]
@@ -9570,6 +9650,10 @@ export type SessionCreateErrors = {
    * BadRequest | InvalidRequestError
    */
   400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type SessionCreateError = SessionCreateErrors[keyof SessionCreateErrors]
@@ -9598,6 +9682,10 @@ export type SessionStatusErrors = {
    * BadRequest | InvalidRequestError
    */
   400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type SessionStatusError = SessionStatusErrors[keyof SessionStatusErrors]
@@ -9668,6 +9756,10 @@ export type SessionGetErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type SessionGetError = SessionGetErrors[keyof SessionGetErrors]
@@ -9711,6 +9803,10 @@ export type SessionUpdateErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type SessionUpdateError = SessionUpdateErrors[keyof SessionUpdateErrors]
@@ -9898,6 +9994,10 @@ export type SessionPromptErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type SessionPromptError = SessionPromptErrors[keyof SessionPromptErrors]
@@ -10014,6 +10114,10 @@ export type SessionForkErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type SessionForkError = SessionForkErrors[keyof SessionForkErrors]
@@ -10155,6 +10259,10 @@ export type SessionShareErrors = {
    */
   404: NotFoundError
   /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
+  /**
    * InternalServerError
    */
   500: EffectHttpApiErrorInternalServerError
@@ -10245,6 +10353,10 @@ export type SessionPromptAsyncErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type SessionPromptAsyncError = SessionPromptAsyncErrors[keyof SessionPromptAsyncErrors]
@@ -10294,6 +10406,10 @@ export type SessionCommandErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type SessionCommandError = SessionCommandErrors[keyof SessionCommandErrors]
@@ -10340,9 +10456,9 @@ export type SessionShellErrors = {
    */
   404: NotFoundError
   /**
-   * SessionBusyError
+   * SessionBusyError | ProjectDeletionInProgressError
    */
-  409: SessionBusyError
+  409: SessionBusyError | ProjectDeletionInProgressError
 }
 
 export type SessionShellError = SessionShellErrors[keyof SessionShellErrors]
@@ -11154,6 +11270,10 @@ export type ExperimentalWorkspaceCreateErrors = {
    * WorkspaceCreateError | BadRequest | InvalidRequestError
    */
   400: WorkspaceCreateError | EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type ExperimentalWorkspaceCreateError =
@@ -11184,6 +11304,10 @@ export type ExperimentalWorkspaceSyncListErrors = {
    * Bad request
    */
   400: BadRequestError
+  /**
+   * ProjectDeletionInProgressError
+   */
+  409: ProjectDeletionInProgressError
 }
 
 export type ExperimentalWorkspaceSyncListError =

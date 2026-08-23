@@ -18,9 +18,12 @@ import {
   ProjectNotRemovableError,
 } from "../errors"
 import { GlobalUpgradeInput } from "../groups/global"
+import { type ProjectDeletingError } from "@/project/deletion-coordinator"
 import { ProjectRemoval } from "@/project/removal"
 
-function projectDeletionFailure(error: { projectID: string; phase: string }) {
+function projectDeletionFailure(
+  error: ProjectDeletingError,
+): Effect.Effect<never, ProjectDeletionInProgressError | ProjectDeletionRetryableError> {
   if (error.phase === "share_failed")
     return Effect.fail(
       new ProjectDeletionRetryableError({
@@ -125,29 +128,35 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
 
     const projectDelete = Effect.fn("GlobalHttpApi.projectDelete")(function* (ctx) {
       yield* removal.remove(ctx.params.projectID).pipe(
-        Effect.catchTag("Project.NotFoundError", () =>
-          Effect.fail(new ProjectNotFoundError({ projectID: ctx.params.projectID, message: "Project not found" })),
-        ),
-        Effect.catchTag("Project.NotRemovableError", () =>
-          Effect.fail(
-            new ProjectNotRemovableError({ projectID: ctx.params.projectID, message: "This project cannot be deleted" }),
-          ),
-        ),
-        Effect.catchTag("ProjectDeletingError", projectDeletionFailure),
+        Effect.catchTags({
+          "Project.NotFoundError": () =>
+            Effect.fail(new ProjectNotFoundError({ projectID: ctx.params.projectID, message: "Project not found" })),
+          "Project.NotRemovableError": () =>
+            Effect.fail(
+              new ProjectNotRemovableError({
+                projectID: ctx.params.projectID,
+                message: "This project cannot be deleted",
+              }),
+            ),
+          ProjectDeletingError: projectDeletionFailure,
+        }),
       )
     })
 
     const projectDeleteRetry = Effect.fn("GlobalHttpApi.projectDeleteRetry")(function* (ctx) {
       yield* removal.retry(ctx.params.projectID).pipe(
-        Effect.catchTag("Project.NotFoundError", () =>
-          Effect.fail(new ProjectNotFoundError({ projectID: ctx.params.projectID, message: "Project not found" })),
-        ),
-        Effect.catchTag("Project.NotRemovableError", () =>
-          Effect.fail(
-            new ProjectNotRemovableError({ projectID: ctx.params.projectID, message: "This project cannot be deleted" }),
-          ),
-        ),
-        Effect.catchTag("ProjectDeletingError", projectDeletionFailure),
+        Effect.catchTags({
+          "Project.NotFoundError": () =>
+            Effect.fail(new ProjectNotFoundError({ projectID: ctx.params.projectID, message: "Project not found" })),
+          "Project.NotRemovableError": () =>
+            Effect.fail(
+              new ProjectNotRemovableError({
+                projectID: ctx.params.projectID,
+                message: "This project cannot be deleted",
+              }),
+            ),
+          ProjectDeletingError: projectDeletionFailure,
+        }),
       )
     })
 

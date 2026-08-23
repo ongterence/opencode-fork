@@ -124,6 +124,15 @@ const scenarios: Scenario[] = [
       path: route("/global/project/{projectID}", { projectID: ctx.state.id }),
     }))
     .status(204, undefined, "status"),
+  // Retrying a project that has not reached share_failed is a valid request with a typed 409 response.
+  http.protected
+    .post("/global/project/{projectID}/delete/retry", "global.project.delete.retry")
+    .mutating()
+    .seeded((ctx) => ctx.project())
+    .at((ctx) => ({
+      path: route("/global/project/{projectID}/delete/retry", { projectID: ctx.state.id }),
+    }))
+    .status(409, undefined, "status"),
   http.protected.get("/path", "path.get").json(200, (body, ctx) => {
     object(body)
     check(body.directory === ctx.directory, "directory should resolve from x-opencode-directory")
