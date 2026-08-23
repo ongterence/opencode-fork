@@ -18,7 +18,7 @@ import {
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2 } from "@opencode-ai/core/event"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Exit, Layer } from "effect"
 import { eq, sql } from "drizzle-orm"
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import path from "path"
@@ -811,6 +811,86 @@ describe("global project delete endpoint", () => {
         ).toContain("worktree branch changed")
         expect((yield* Effect.promise(() => $`git show-ref --verify --quiet refs/heads/deletion-owner`.cwd(tmp.directory).quiet().nothrow())).exitCode).toBe(0)
         expect((yield* Effect.promise(() => $`git show-ref --verify --quiet refs/heads/deletion-personal`.cwd(tmp.directory).quiet().nothrow())).exitCode).toBe(0)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "removes a detached worktree journaled with a null branch",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const fs = yield* FSUtil.Service
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const worktree = path.join(
+          deletionTarget({
+            pathApi: path,
+            dataRoot: Global.Path.data,
+            category: "worktree",
+            projectID: project.id,
+          }),
+          "detached",
+        )
+        const { db } = yield* Database.Service
+        yield* Effect.promise(() => $`git worktree add --detach ${worktree} HEAD`.cwd(tmp.directory).quiet())
+        yield* db.run(sql`UPDATE project SET sandboxes = ${JSON.stringify([worktree])} WHERE id = ${project.id}`).pipe(Effect.orDie)
+
+        const removed = yield* request(`/global/project/${project.id}`, { method: "DELETE" })
+        expect(removed.status).toBe(204)
+        expect(yield* fs.exists(worktree)).toBe(false)
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, project.id)).get().pipe(Effect.orDie),
+        ).toBeUndefined()
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "aborts begin without a deletion journal when branch snapshot git cannot start",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const worktree = path.join(
+          deletionTarget({
+            pathApi: path,
+            dataRoot: Global.Path.data,
+            category: "worktree",
+            projectID: project.id,
+          }),
+          "snapshot-spawn-failure",
+        )
+        const { db } = yield* Database.Service
+        yield* Effect.promise(() => $`git worktree add -b deletion-snapshot-failure ${worktree}`.cwd(tmp.directory).quiet())
+        yield* db.run(sql`UPDATE project SET sandboxes = ${JSON.stringify([worktree])} WHERE id = ${project.id}`).pipe(Effect.orDie)
+        const coordinator = yield* ProjectDeletionCoordinator.Service
+        const snapshot = yield* Effect.acquireUseRelease(
+          Effect.sync(() => {
+            const previous = { PATH: process.env.PATH, Path: process.env.Path }
+            const missing = path.join(tmp.directory, "missing-git")
+            process.env.PATH = missing
+            process.env.Path = missing
+            return previous
+          }),
+          () => coordinator.begin(project.id).pipe(Effect.exit),
+          (previous) =>
+            Effect.sync(() => {
+              if (previous.PATH === undefined) delete process.env.PATH
+              else process.env.PATH = previous.PATH
+              if (previous.Path === undefined) delete process.env.Path
+              else process.env.Path = previous.Path
+            }),
+        )
+
+        expect(Exit.isFailure(snapshot)).toBe(true)
+        expect(
+          yield* db.select().from(ProjectDeletionJobTable).where(eq(ProjectDeletionJobTable.project_id, project.id)).get().pipe(Effect.orDie),
+        ).toBeUndefined()
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, project.id)).get().pipe(Effect.orDie),
+        ).toBeDefined()
       }),
     { git: true },
   )

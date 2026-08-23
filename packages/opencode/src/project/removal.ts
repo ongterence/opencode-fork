@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import {
   ProjectDeletionArtifactTable,
@@ -219,7 +219,7 @@ const layer = Layer.effect(
       )
       const prepared = yield* Effect.forEach(owned, (entry) => {
         const listedEntry = listedByPath.get(identity(entry.canonical_path))
-        const discoveredBranch = listedEntry?.branch?.replace(/^refs\/heads\//, "")
+        const discoveredBranch = listedEntry?.branch ? listedEntry.branch.replace(/^refs\/heads\//, "") : null
         if (listedEntry && entry.branch !== discoveredBranch)
           return Effect.fail(new Error(`worktree branch changed for ${entry.canonical_path}`))
         return Effect.succeed({ ...entry, listed: Boolean(listedEntry) })

@@ -1,9 +1,9 @@
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import { Database } from "@opencode-ai/core/database/database"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
-import { Git } from "@opencode-ai/core/git"
 import { Global } from "@opencode-ai/core/global"
 import {
   type DeletionPhase,
@@ -14,11 +14,12 @@ import {
 } from "@opencode-ai/core/project/deletion.sql"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
-import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { and, eq, inArray, sql } from "drizzle-orm"
 import { Cause, Context, Deferred, Duration, Effect, Exit, Layer, Schema } from "effect"
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
+import * as Stream from "effect/Stream"
 import path from "path"
 import { NotFoundError, NotRemovableError } from "./project-errors"
 import { ownedProjectWorktreeTarget } from "./removal-paths"
@@ -600,18 +601,30 @@ export function make(options: MakeOptions = {}) {
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const git = yield* Git.Service
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
     return yield* make({
       worktreeBranch: (directory) =>
         Effect.gen(function* () {
-          const repo = yield* git.repo.discover(AbsolutePath.make(directory))
-          if (!repo) return null
-          return (yield* git.history.branch(repo)) ?? null
-        }),
+          const handle = yield* spawner.spawn(
+            ChildProcess.make("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+              cwd: directory,
+              extendEnv: true,
+              stdin: "ignore",
+            }),
+          )
+          const [text, stderr] = yield* Effect.all(
+            [Stream.mkString(Stream.decodeText(handle.stdout)), Stream.mkString(Stream.decodeText(handle.stderr))],
+            { concurrency: 2 },
+          )
+          const code = yield* handle.exitCode
+          if (code === 0 && text.trim()) return text.trim()
+          if (code === 1 && !text.trim() && !stderr.trim()) return null
+          return yield* Effect.fail(new Error(`git branch snapshot failed for ${directory}: ${stderr || text}`))
+        }).pipe(Effect.scoped),
     })
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, Git.node] })
+export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, CrossSpawnSpawner.node] })
 
 export * as ProjectDeletionCoordinator from "./deletion-coordinator"
