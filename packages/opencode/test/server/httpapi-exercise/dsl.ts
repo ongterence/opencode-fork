@@ -201,10 +201,16 @@ export function route(template: string, params: Record<string, string>) {
   )
 }
 
-export function controlledPtyInput(title: string | undefined) {
+export function controlledPtyInput(title?: string) {
+  const windows = process.platform === "win32"
   return {
-    command: "/bin/sh",
-    args: ["-c", "sleep 30"],
+    // Keep the PTY alive long enough for the route response and cleanup while
+    // using a shell that exists on the runner's platform. This fixture is
+    // shared by the legacy and canonical PTY HTTP surfaces.
+    command: windows ? "powershell.exe" : "/bin/sh",
+    args: windows
+      ? ["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]
+      : ["-c", "sleep 30"],
     ...(title ? { title } : {}),
   }
 }
