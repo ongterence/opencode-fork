@@ -394,11 +394,15 @@ jobs:
           $appUpdatePath = $appUpdateFiles[0].FullName
           $unpackedDirectory = Split-Path (Split-Path $appUpdatePath -Parent) -Parent
           $appUpdate = Get-Content $appUpdatePath -Raw
-          if ($appUpdate -notmatch "(?m)^publisherName:\s*$") {
-            throw "Packaged update configuration has no publisherName"
+          $publisherBlock = [regex]::Match(
+            $appUpdate,
+            "(?m)^publisherName:\s*\r?\n(?<values>(?:^[ \t]+.*(?:\r?\n|$))*)"
+          )
+          if (-not $publisherBlock.Success) {
+            throw "Packaged update configuration has no publisherName block"
           }
           $publisherLine = "(?m)^\s*-\s*" + [regex]::Escape($env:OPENCODE_WINDOWS_PUBLISHER_NAME) + "\s*$"
-          if ($appUpdate -notmatch $publisherLine) {
+          if ($publisherBlock.Groups["values"].Value -notmatch $publisherLine) {
             throw "Packaged update configuration does not pin the approved publisher"
           }
 
