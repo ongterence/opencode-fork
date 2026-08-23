@@ -16,10 +16,22 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 function extractRetryableDeleteError(error: unknown): RetryableDeleteError | undefined {
-  const cause = record(error) && record(error.cause) ? error.cause : undefined
-  const value = cause && "body" in cause ? cause.body : error
+  let value = error
+  if (error instanceof Error) {
+    if (!record(error.cause) || error.cause.status !== 409) return
+    value = error.cause.body
+  }
   if (!record(value)) return
-  if (value.code !== "project_deletion_retryable" || value.phase !== "share_failed" || value.retry !== true) return
+  if (
+    value._tag !== "ProjectDeletionRetryableError" ||
+    typeof value.projectID !== "string" ||
+    value.projectID.length === 0 ||
+    value.code !== "project_deletion_retryable" ||
+    value.phase !== "share_failed" ||
+    value.retry !== true
+  ) {
+    return
+  }
   return value
 }
 

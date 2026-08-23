@@ -59,6 +59,7 @@ describe("delete project dialog", () => {
       remove: async () => {
         throw {
           _tag: "ProjectDeletionRetryableError",
+          projectID: "project-1",
           code: "project_deletion_retryable",
           phase: "share_failed",
           retry: true,
@@ -93,11 +94,14 @@ describe("delete project dialog", () => {
         throw new Error("Project deletion is retryable", {
           cause: {
             body: {
+              _tag: "ProjectDeletionRetryableError",
+              projectID: "project-1",
               code: "project_deletion_retryable",
               phase: "share_failed",
               retry: true,
               message: "Remote share revocation is still required",
             },
+            status: 409,
           },
         })
       },
@@ -115,6 +119,76 @@ describe("delete project dialog", () => {
     expect(focused).toBe(1)
   })
 
+  const rejectedContracts = [
+    [
+      "wrong error tag",
+      {
+        _tag: "ProjectDeletionInProgressError",
+        projectID: "project-1",
+        code: "project_deletion_retryable",
+        phase: "share_failed",
+        retry: true,
+      },
+    ],
+    [
+      "missing error tag",
+      {
+        projectID: "project-1",
+        code: "project_deletion_retryable",
+        phase: "share_failed",
+        retry: true,
+      },
+    ],
+    [
+      "empty project ID",
+      {
+        _tag: "ProjectDeletionRetryableError",
+        projectID: "",
+        code: "project_deletion_retryable",
+        phase: "share_failed",
+        retry: true,
+      },
+    ],
+    [
+      "wrong HTTP status",
+      new Error("Project deletion conflict", {
+        cause: {
+          body: {
+            _tag: "ProjectDeletionRetryableError",
+            projectID: "project-1",
+            code: "project_deletion_retryable",
+            phase: "share_failed",
+            retry: true,
+          },
+          status: 500,
+        },
+      }),
+    ],
+  ] as const
+
+  for (const [name, error] of rejectedContracts) {
+    test(`rejects a retryable-looking value with ${name}`, async () => {
+      let failed = 0
+      let focused = 0
+      const controller = createController({
+        remove: async () => {
+          throw error
+        },
+        retry: async () => {},
+        onDeleted: () => {},
+        close: () => {},
+        focusRetry: () => focused++,
+        onFailure: () => failed++,
+      })
+      controller.setAcknowledgement("DELETE")
+
+      await controller.submit()
+      expect(controller.state()).toBe("confirming")
+      expect(failed).toBe(1)
+      expect(focused).toBe(0)
+    })
+  }
+
   test("does not offer Retry for a conflict outside share_failed", async () => {
     let failed = 0
     let focused = 0
@@ -122,6 +196,7 @@ describe("delete project dialog", () => {
       remove: async () => {
         throw {
           _tag: "ProjectDeletionRetryableError",
+          projectID: "project-1",
           code: "project_deletion_retryable",
           phase: "deleting_local_data",
           retry: true,
