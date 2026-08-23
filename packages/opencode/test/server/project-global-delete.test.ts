@@ -1,5 +1,7 @@
 import { afterEach, describe, expect } from "bun:test"
 import { $ } from "bun"
+import { NodeHttpServer } from "@effect/platform-node"
+import Http from "node:http"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -10,18 +12,21 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import {
   ProjectDeletionArtifactTable,
   ProjectDeletionJobTable,
+  ProjectDeletionShareTable,
   ProjectDeletionWorktreeTable,
 } from "@opencode-ai/core/project/deletion.sql"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2 } from "@opencode-ai/core/event"
 import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
-import { Effect, Layer } from "effect"
+import { Context, Effect, Layer } from "effect"
 import { eq } from "drizzle-orm"
+import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import path from "path"
 import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
 import { Snapshot } from "../../src/snapshot"
 import { ProjectDeletionCoordinator } from "../../src/project/deletion-coordinator"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
+import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { resetDatabase } from "../fixture/db"
@@ -58,6 +63,28 @@ function collectGlobalEvents() {
     }),
     ({ on }) => Effect.sync(() => GlobalBus.off("event", on)),
   )
+}
+
+function listenShareServer(
+  status: number | number[] | ((request: HttpServerRequest.HttpServerRequest) => number),
+  requests: Array<{ method: string; url: string; body: string }> = [],
+) {
+  return Effect.gen(function* () {
+    const responses = typeof status === "number" ? [status] : Array.isArray(status) ? [...status] : []
+    const context = yield* Layer.build(NodeHttpServer.layer(Http.createServer, { host: "127.0.0.1", port: 0 }))
+    const server = Context.get(context, HttpServer.HttpServer)
+    yield* server.serve(
+      HttpServerRequest.HttpServerRequest.use((request) =>
+        Effect.gen(function* () {
+          requests.push({ method: request.method, url: request.url, body: yield* request.text })
+          return HttpServerResponse.empty({
+            status: typeof status === "function" ? status(request) : (responses.shift() ?? 500),
+          })
+        }),
+      ),
+    )
+    return HttpServer.formatAddress(server.address)
+  })
 }
 
 describe("global project delete endpoint", () => {
@@ -265,6 +292,153 @@ describe("global project delete endpoint", () => {
           .all()
           .pipe(Effect.orDie)).find((entry) => entry.id === project.id)
         expect(row?.name).not.toBe("late")
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "retains share credentials and local rows when historical remote revocation fails",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const created = yield* requestInDirectory("/session", tmp.directory, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        })
+        const session = (yield* created.json) as { id: SessionID }
+        const { db } = yield* Database.Service
+        const remoteRequests: Array<{ method: string; url: string; body: string }> = []
+        const shareServer = yield* listenShareServer(500, remoteRequests)
+        yield* db
+          .insert(SessionShareTable)
+          .values({
+            session_id: session.id,
+            id: "shr_retained",
+            secret: "sec_retained",
+            url: `${shareServer}/share/retained`,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        const events = yield* collectGlobalEvents()
+        const response = yield* request(`/global/project/${project.id}`, { method: "DELETE" })
+
+        expect(response.status).toBe(409)
+        expect(remoteRequests).toHaveLength(3)
+        expect(remoteRequests[0]).toEqual({
+          method: "DELETE",
+          url: "/api/share/shr_retained",
+          body: JSON.stringify({ secret: "sec_retained" }),
+        })
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, project.id)).get().pipe(Effect.orDie),
+        ).toBeDefined()
+        expect(
+          yield* db
+            .select()
+            .from(SessionShareTable)
+            .where(eq(SessionShareTable.session_id, session.id))
+            .get()
+            .pipe(Effect.orDie),
+        ).toMatchObject({ secret: "sec_retained" })
+        expect(
+          yield* db
+            .select()
+            .from(ProjectDeletionShareTable)
+            .where(eq(ProjectDeletionShareTable.project_id, project.id))
+            .get()
+            .pipe(Effect.orDie),
+        ).toMatchObject({ status: "failed", secret: "sec_retained", base_url: shareServer })
+        expect(events.seen.filter((event) => event.payload.type === "project.deleted")).toHaveLength(0)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "scrubs only a share acknowledged absent before a later revocation failure",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const created = yield* Effect.all(
+          [
+            requestInDirectory("/session", tmp.directory, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: "{}",
+            }),
+            requestInDirectory("/session", tmp.directory, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: "{}",
+            }),
+          ],
+          { concurrency: 1 },
+        )
+        const first = (yield* created[0].json) as { id: SessionID }
+        const second = (yield* created[1].json) as { id: SessionID }
+        const absent = first.id < second.id ? first : second
+        const failed = first.id < second.id ? second : first
+        const { db } = yield* Database.Service
+        const shareServer = yield* listenShareServer((request) => (request.url.endsWith("shr_absent") ? 404 : 500))
+        yield* db
+          .insert(SessionShareTable)
+          .values([
+            {
+              session_id: absent.id,
+              id: "shr_absent",
+              secret: "sec_absent",
+              url: `${shareServer}/share/absent`,
+            },
+            {
+              session_id: failed.id,
+              id: "shr_failed",
+              secret: "sec_failed",
+              url: `${shareServer}/share/failed`,
+            },
+          ])
+          .run()
+          .pipe(Effect.orDie)
+        const events = yield* collectGlobalEvents()
+        const response = yield* request(`/global/project/${project.id}`, { method: "DELETE" })
+
+        expect(response.status).toBe(409)
+        expect(
+          yield* db
+            .select()
+            .from(SessionShareTable)
+            .where(eq(SessionShareTable.session_id, absent.id))
+            .get()
+            .pipe(Effect.orDie),
+        ).toBeUndefined()
+        expect(
+          yield* db
+            .select()
+            .from(SessionShareTable)
+            .where(eq(SessionShareTable.session_id, failed.id))
+            .get()
+            .pipe(Effect.orDie),
+        ).toMatchObject({ secret: "sec_failed" })
+        expect(
+          yield* db
+            .select()
+            .from(ProjectDeletionShareTable)
+            .where(eq(ProjectDeletionShareTable.session_id, absent.id))
+            .get()
+            .pipe(Effect.orDie),
+        ).toMatchObject({ status: "revoked", secret: "" })
+        expect(
+          yield* db
+            .select()
+            .from(ProjectDeletionShareTable)
+            .where(eq(ProjectDeletionShareTable.session_id, failed.id))
+            .get()
+            .pipe(Effect.orDie),
+        ).toMatchObject({ status: "failed", secret: "sec_failed" })
+        expect(events.seen.filter((event) => event.payload.type === "project.deleted")).toHaveLength(0)
       }),
     { git: true },
   )

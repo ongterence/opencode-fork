@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect } from "bun:test"
 import { Effect, Exit, Layer, Option } from "effect"
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { HttpClient, HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -208,6 +208,107 @@ describe("ShareNext", () => {
       },
       { config: { enterprise: { url: "https://legacy-share.example.com" } } },
     ),
+  )
+
+  it.live("revokeHistorical deletes a persisted share while new sharing is disabled", () =>
+    provideTmpdirInstance(() => {
+      const seen: HttpClientRequest.HttpClientRequest[] = []
+      const client = HttpClient.make((req) => {
+        seen.push(req)
+        return Effect.succeed(HttpClientResponse.fromWeb(req, new Response(null, { status: 204 })))
+      })
+      return Effect.gen(function* () {
+        const result = yield* ShareNext.Service.use((svc) =>
+          svc.revokeHistorical({
+            sessionID: "ses_historical" as SessionID,
+            shareID: "shr_abc",
+            secret: "sec_123",
+            baseUrl: "https://legacy-share.example.com",
+          }),
+        )
+
+        expect(result).toBe("revoked")
+        expect(seen.map((req) => [req.method, req.url])).toEqual([
+          ["DELETE", "https://legacy-share.example.com/api/share/shr_abc"],
+        ])
+      }).pipe(Effect.provide(requestLayer(client)))
+    }),
+  )
+
+  it.live("revokeHistorical treats an absent remote share as success", () =>
+    provideTmpdirInstance(() => {
+      const client = HttpClient.make((req) =>
+        Effect.succeed(HttpClientResponse.fromWeb(req, new Response(null, { status: 404 }))),
+      )
+      return ShareNext.Service.use((svc) =>
+        Effect.gen(function* () {
+          const result = yield* svc.revokeHistorical({
+            sessionID: "ses_historical" as SessionID,
+            shareID: "shr_absent",
+            secret: "sec_123",
+            baseUrl: "https://legacy-share.example.com",
+          })
+
+          expect(result).toBe("already_absent")
+        }),
+      ).pipe(Effect.provide(requestLayer(client)))
+    }),
+  )
+
+  it.live("revokeHistorical retains the remote response status for retry decisions", () =>
+    provideTmpdirInstance(() =>
+      Effect.forEach(
+        [401, 403, 500],
+        (status) => {
+          const client = HttpClient.make((req) =>
+            Effect.succeed(HttpClientResponse.fromWeb(req, new Response(null, { status }))),
+          )
+          return ShareNext.Service.use((svc) =>
+            Effect.gen(function* () {
+              const error = yield* Effect.flip(
+                svc.revokeHistorical({
+                  sessionID: "ses_historical" as SessionID,
+                  shareID: "shr_rejected",
+                  secret: "sec_123",
+                  baseUrl: "https://legacy-share.example.com",
+                }),
+              )
+
+              expect(error).toBeInstanceOf(ShareNext.RemoteShareRevocationError)
+              expect(error.status).toBe(status)
+            }),
+          ).pipe(Effect.provide(requestLayer(client)))
+        },
+        { discard: true },
+      ),
+    ),
+  )
+
+  it.live("revokeHistorical exposes network failures without a response status", () =>
+    provideTmpdirInstance(() => {
+      const client = HttpClient.make((req) =>
+        Effect.fail(
+          new HttpClientError.HttpClientError({
+            reason: new HttpClientError.TransportError({ request: req }),
+          }),
+        ),
+      )
+      return ShareNext.Service.use((svc) =>
+        Effect.gen(function* () {
+          const error = yield* Effect.flip(
+            svc.revokeHistorical({
+              sessionID: "ses_historical" as SessionID,
+              shareID: "shr_network",
+              secret: "sec_123",
+              baseUrl: "https://legacy-share.example.com",
+            }),
+          )
+
+          expect(error).toBeInstanceOf(ShareNext.RemoteShareRevocationError)
+          expect(error.status).toBeUndefined()
+        }),
+      ).pipe(Effect.provide(requestLayer(client)))
+    }),
   )
 
   it.live("create fails on a non-ok response and does not persist a share", () =>

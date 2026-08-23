@@ -22,6 +22,18 @@ import { EventV2 } from "@opencode-ai/core/event"
 
 const disabled = process.env["OPENCODE_DISABLE_SHARE"] === "true" || process.env["OPENCODE_DISABLE_SHARE"] === "1"
 
+export type RemoteShareCredential = { sessionID: SessionID; shareID: string; secret: string; baseUrl: string }
+export type RevokeResult = "revoked" | "already_absent"
+
+export class RemoteShareRevocationError extends Schema.TaggedErrorClass<RemoteShareRevocationError>()(
+  "RemoteShareRevocationError",
+  {
+    message: Schema.String,
+    status: Schema.optional(Schema.Number),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
 export type Api = {
   create: string
   sync: (shareID: string) => string
@@ -76,6 +88,7 @@ export interface Interface {
   readonly request: () => Effect.Effect<Req, unknown>
   readonly create: (sessionID: SessionID) => Effect.Effect<Share, unknown>
   readonly remove: (sessionID: SessionID) => Effect.Effect<void, unknown>
+  readonly revokeHistorical: (input: RemoteShareCredential) => Effect.Effect<RevokeResult, RemoteShareRevocationError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ShareNext") {}
@@ -364,7 +377,26 @@ const layer = Layer.effect(
       s.queue.delete(sessionID)
     })
 
-    return Service.of({ init, url, request, create, remove })
+    const revokeHistorical = Effect.fn("ShareNext.revokeHistorical")(function* (input: RemoteShareCredential) {
+      const response = yield* HttpClientRequest.delete(`${input.baseUrl}${legacyApi.remove(input.shareID)}`).pipe(
+        HttpClientRequest.bodyJson({ secret: input.secret }),
+        Effect.flatMap((request) => http.execute(request)),
+        Effect.catch((cause) =>
+          new RemoteShareRevocationError({
+            message: `Could not revoke historical share ${input.shareID}`,
+            cause,
+          }),
+        ),
+      )
+      if (response.status >= 200 && response.status < 300) return "revoked" as const
+      if (response.status === 404) return "already_absent" as const
+      return yield* new RemoteShareRevocationError({
+        message: `Could not revoke historical share ${input.shareID}: received HTTP ${response.status}`,
+        status: response.status,
+      })
+    })
+
+    return Service.of({ init, url, request, create, remove, revokeHistorical })
   }),
 )
 

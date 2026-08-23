@@ -1,6 +1,10 @@
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
-import { ProjectDeletionArtifactTable, ProjectDeletionWorktreeTable } from "@opencode-ai/core/project/deletion.sql"
+import {
+  ProjectDeletionArtifactTable,
+  ProjectDeletionShareTable,
+  ProjectDeletionWorktreeTable,
+} from "@opencode-ai/core/project/deletion.sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -13,13 +17,12 @@ import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2 } from "@opencode-ai/core/event"
-import { Context, Effect, Layer, Schedule, Scope } from "effect"
+import { Cause, Context, Effect, Layer, Schedule, Scope } from "effect"
 import { existsSync } from "fs"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import * as Stream from "effect/Stream"
 import path from "path"
 import { Workspace } from "@/control-plane/workspace"
-import { InstanceRef } from "@/effect/instance-ref"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
@@ -285,26 +288,76 @@ const layer = Layer.effect(
     })
 
     const revokeShares = Effect.fn("ProjectRemoval.revokeShares")(function* (projectID: ProjectV2.ID) {
-      const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
-      if (!row) return yield* new Project.NotFoundError({ projectID })
-      const info = Project.fromRow(row)
-      const ctx = yield* instanceStore.load({ directory: info.worktree })
-      const ids = (yield* db
-        .select({ id: SessionShareTable.session_id })
-        .from(SessionShareTable)
-        .innerJoin(SessionTable, eq(SessionTable.id, SessionShareTable.session_id))
-        .where(eq(SessionTable.project_id, projectID))
+      const shares = yield* db
+        .select()
+        .from(ProjectDeletionShareTable)
+        .where(eq(ProjectDeletionShareTable.project_id, projectID))
+        .orderBy(ProjectDeletionShareTable.session_id)
         .all()
-        .pipe(Effect.orDie)).map((entry) => SessionID.make(entry.id))
+        .pipe(Effect.orDie)
       yield* Effect.forEach(
-        ids,
-        (id) =>
-          shareNext
-            .remove(id)
-            .pipe(
-              Effect.provideService(InstanceRef, ctx),
-              Effect.retry({ times: 2, schedule: Schedule.spaced("200 millis") }),
-            ),
+        shares.filter((share) => share.status !== "revoked"),
+        (share) =>
+          Effect.gen(function* () {
+            const baseUrl = new URL(share.base_url).origin
+            yield* shareNext
+              .revokeHistorical({
+                sessionID: SessionID.make(share.session_id),
+                shareID: share.share_id,
+                secret: share.secret,
+                baseUrl,
+              })
+              .pipe(
+                Effect.flatMap(() =>
+                  db
+                    .transaction(
+                      (tx) =>
+                        Effect.gen(function* () {
+                          yield* tx
+                            .update(ProjectDeletionShareTable)
+                            .set({ status: "revoked", secret: "", last_error: null, updated_at: Date.now() })
+                            .where(
+                              and(
+                                eq(ProjectDeletionShareTable.project_id, projectID),
+                                eq(ProjectDeletionShareTable.session_id, share.session_id),
+                              ),
+                            )
+                            .run()
+                          yield* tx
+                            .delete(SessionShareTable)
+                            .where(eq(SessionShareTable.session_id, share.session_id))
+                            .run()
+                        }),
+                      { behavior: "immediate" },
+                    )
+                    .pipe(Effect.orDie),
+                ),
+                Effect.catchCause((cause) =>
+                  db
+                    .transaction(
+                      (tx) =>
+                        tx
+                          .update(ProjectDeletionShareTable)
+                          .set({
+                            status: "failed",
+                            attempt: share.attempt + 1,
+                            last_error: Cause.pretty(cause),
+                            updated_at: Date.now(),
+                          })
+                          .where(
+                            and(
+                              eq(ProjectDeletionShareTable.project_id, projectID),
+                              eq(ProjectDeletionShareTable.session_id, share.session_id),
+                            ),
+                          )
+                          .run(),
+                      { behavior: "immediate" },
+                    )
+                    .pipe(Effect.orDie, Effect.andThen(Effect.failCause(cause))),
+                ),
+                Effect.retry({ times: 2, schedule: Schedule.spaced("200 millis") }),
+              )
+          }),
         { discard: true },
       )
     })

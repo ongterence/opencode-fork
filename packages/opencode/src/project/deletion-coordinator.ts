@@ -382,7 +382,7 @@ export function make(options: MakeOptions = {}) {
                             session_id: share.sessionID,
                             share_id: share.shareID,
                             secret: share.secret,
-                            base_url: share.baseUrl,
+                            base_url: new URL(share.baseUrl).origin,
                             status: "pending" as const,
                             attempt: 0,
                             last_error: null,
