@@ -20,8 +20,9 @@ import {
   setTitlebar,
   updateTitlebar,
 } from "./windows"
-import type { UpdaterController } from "./updater-controller"
+import { installWithErrorSurface, type UpdaterController } from "./updater-controller"
 import { createUpdaterSubscriptions } from "./updater-subscriptions"
+import { showUpdaterInstallError } from "./updater"
 import { createDesktopDraftStore } from "./draft-store"
 import { nativeT } from "./native-translations"
 
@@ -93,7 +94,9 @@ export function registerIpcHandlers(deps: Deps) {
   })
   ipcMain.handle("updater-unsubscribe", (event) => updaterSubscriptions.delete(event.sender.id))
   ipcMain.handle("updater-check", () => deps.updater.check())
-  ipcMain.handle("updater-install", () => deps.updater.install())
+  ipcMain.handle("updater-install", () =>
+    installWithErrorSurface(() => deps.updater.install(), showUpdaterInstallError),
+  )
   ipcMain.handle("set-background-color", (_event: IpcMainInvokeEvent, color: string) => deps.setBackgroundColor(color))
   ipcMain.handle("export-debug-logs", () => deps.exportDebugLogs())
   ipcMain.handle("set-force-focus", (event: IpcMainInvokeEvent, enabled: boolean) =>

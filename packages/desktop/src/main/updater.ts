@@ -1,7 +1,7 @@
 import { app, dialog } from "electron"
 import pkg from "electron-updater"
 import { UPDATER_ENABLED } from "./constants"
-import { createUpdaterController, type UpdaterReadyRecord } from "./updater-controller"
+import { createUpdaterController, installWithErrorSurface, type UpdaterReadyRecord } from "./updater-controller"
 import { getLogger } from "./logging"
 import { getStore } from "./store"
 import { setAppQuitting } from "./windows"
@@ -61,6 +61,14 @@ export function setupAutoUpdater(input: { prepareShutdown: () => Promise<void>; 
   })
 }
 
+export async function showUpdaterInstallError(message: string) {
+  await dialog.showMessageBox({
+    type: "error",
+    message: message || nativeT("desktop.updater.dialog.checkFailed.message"),
+    title: nativeT("desktop.updater.dialog.checkFailed.title"),
+  })
+}
+
 export async function showUpdaterDialog(controller: ReturnType<typeof setupAutoUpdater>, alertOnFail: boolean) {
   const state = await controller.check()
   if (state.status === "error") {
@@ -91,5 +99,6 @@ export async function showUpdaterDialog(controller: ReturnType<typeof setupAutoU
     defaultId: 0,
     cancelId: 1,
   })
-  if (response.response === 0) await controller.install()
+  if (response.response === 0)
+    await installWithErrorSurface(() => controller.install(), showUpdaterInstallError)
 }

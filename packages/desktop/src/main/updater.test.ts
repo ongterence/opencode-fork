@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { prepareServerShutdown } from "./updater-controller"
+import { installWithErrorSurface, prepareServerShutdown } from "./updater-controller"
 
 describe("updater shutdown preparation", () => {
   test("calls the authenticated local deletion drain endpoint", async () => {
@@ -29,5 +29,21 @@ describe("updater shutdown preparation", () => {
           ),
       ),
     ).rejects.toThrow("Project deletion could not reach a durable shutdown boundary")
+  })
+
+  test("surfaces an install failure message and consumes the rejection", async () => {
+    const messages: string[] = []
+
+    await expect(
+      installWithErrorSurface(
+        async () => {
+          throw new Error("Project deletion could not reach a durable shutdown boundary")
+        },
+        async (message) => {
+          messages.push(message)
+        },
+      ),
+    ).resolves.toBeUndefined()
+    expect(messages).toEqual(["Project deletion could not reach a durable shutdown boundary"])
   })
 })

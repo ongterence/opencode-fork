@@ -27,6 +27,17 @@ export async function prepareServerShutdown(
   throw new Error(message)
 }
 
+export async function installWithErrorSurface(
+  install: () => Promise<void>,
+  surface: (message: string) => Promise<void>,
+) {
+  try {
+    await install()
+  } catch (error) {
+    await surface(error instanceof Error ? error.message : String(error))
+  }
+}
+
 export type UpdaterBackend = {
   checkForUpdates(): Promise<{ isUpdateAvailable?: boolean; updateInfo?: { version?: string } } | null | undefined>
   downloadUpdate(): Promise<unknown>
