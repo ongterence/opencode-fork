@@ -19,7 +19,7 @@ import { and, eq, inArray, sql } from "drizzle-orm"
 import { Cause, Context, Deferred, Duration, Effect, Exit, Layer, Schema } from "effect"
 import path from "path"
 import { NotFoundError, NotRemovableError } from "./project-errors"
-import { ownedWorktreeTarget } from "./removal-paths"
+import { ownedProjectWorktreeTarget } from "./removal-paths"
 
 export type DeleteOutcome =
   | { status: "completed" }
@@ -452,7 +452,7 @@ export function make(options: MakeOptions = {}) {
                           return [
                             {
                               ...item,
-                              path: ownedWorktreeTarget({
+                              path: ownedProjectWorktreeTarget({
                                 pathApi: path,
                                 dataRoot: Global.Path.data,
                                 projectID,

@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto"
-import path from "node:path"
-
-type PathApi = typeof import("node:path").posix
+export type PathApi = {
+  readonly sep: string
+  resolve(...paths: string[]): string
+  join(...paths: string[]): string
+  relative(from: string, to: string): string
+  isAbsolute(path: string): boolean
+}
 
 export class UnsafeLegacyMetadataError extends Error {
   readonly code = "unsafe_legacy_metadata"
@@ -67,6 +71,34 @@ export function ownedWorktreeTarget(input: {
     projectID: input.projectID,
   })
   return requireStrictDescendant(input.pathApi, root, input.candidate)
+}
+
+export function ownedLegacyWorktreeTarget(input: {
+  pathApi: PathApi
+  dataRoot: string
+  projectID: string
+  candidate: string
+}): string {
+  const root = legacyDeletionTarget({
+    pathApi: input.pathApi,
+    dataRoot: input.dataRoot,
+    category: "worktree",
+    projectID: input.projectID,
+  })
+  return requireStrictDescendant(input.pathApi, root, input.candidate)
+}
+
+export function ownedProjectWorktreeTarget(input: {
+  pathApi: PathApi
+  dataRoot: string
+  projectID: string
+  candidate: string
+}): string {
+  try {
+    return ownedWorktreeTarget(input)
+  } catch {
+    return ownedLegacyWorktreeTarget(input)
+  }
 }
 
 export function legacyDeletionTarget(input: {

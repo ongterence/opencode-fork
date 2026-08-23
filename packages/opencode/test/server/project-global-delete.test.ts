@@ -17,7 +17,7 @@ import {
 } from "@opencode-ai/core/project/deletion.sql"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { EventV2 } from "@opencode-ai/core/event"
-import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { Context, Effect, Layer } from "effect"
 import { eq, sql } from "drizzle-orm"
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
@@ -655,6 +655,7 @@ describe("global project delete endpoint", () => {
           projectID: project.id,
         })
         const worktree = path.join(root, "retry-locked")
+        const legacyWorktree = path.join(Global.Path.data, "worktree", project.id, "legacy-owned")
         const sibling = path.join(
           Global.Path.data,
           "project-artifacts",
@@ -686,9 +687,10 @@ describe("global project delete endpoint", () => {
           .run()
           .pipe(Effect.orDie)
         yield* Effect.promise(() => $`git worktree add -b deletion-retry ${worktree}`.cwd(tmp.directory).quiet())
+        yield* Effect.promise(() => $`git worktree add -b deletion-legacy ${legacyWorktree}`.cwd(tmp.directory).quiet())
         yield* Effect.promise(() => $`git worktree add -b deletion-sibling ${sibling}`.cwd(tmp.directory).quiet())
         yield* Effect.promise(() => $`git worktree lock ${worktree}`.cwd(tmp.directory).quiet())
-        yield* db.run(sql`UPDATE project SET sandboxes = ${JSON.stringify([worktree])} WHERE id = ${project.id}`).pipe(Effect.orDie)
+        yield* db.run(sql`UPDATE project SET sandboxes = ${JSON.stringify([worktree, legacyWorktree])} WHERE id = ${project.id}`).pipe(Effect.orDie)
         yield* Effect.forEach(
           [artifact, sessionDiffArtifact, path.join(messageArtifact, "data"), path.join(partArtifact, "data")],
           (target) => Effect.promise(() => Bun.write(target, "must be removed")),
@@ -703,6 +705,24 @@ describe("global project delete endpoint", () => {
         ).toBe(true)
         expect(yield* fs.exists(worktree)).toBe(true)
         expect(yield* fs.exists(artifact)).toBe(true)
+        // The local cleanup has already projected the session removal when the
+        // locked worktree makes a later required operation fail. Keep an
+        // aggregate behind to prove recovery uses the immutable journal rather
+        // than rediscovering sessions from the now-empty live table.
+        expect(
+          yield* db.select().from(SessionTable).where(eq(SessionTable.id, session.id)).get().pipe(Effect.orDie),
+        ).toBeUndefined()
+        yield* db.insert(EventSequenceTable).values({ aggregate_id: session.id, seq: 1 }).run().pipe(Effect.orDie)
+        expect(
+          (yield* db
+            .select({ path: ProjectDeletionWorktreeTable.canonical_path, branch: ProjectDeletionWorktreeTable.branch })
+            .from(ProjectDeletionWorktreeTable)
+            .where(eq(ProjectDeletionWorktreeTable.project_id, project.id))
+            .all()
+            .pipe(Effect.orDie))
+            .map((entry) => `${entry.path}:${entry.branch}`)
+            .sort(),
+        ).toEqual([`${legacyWorktree}:deletion-legacy`, `${worktree}:deletion-retry`].sort())
         expect(
           (yield* db
             .select({ kind: ProjectDeletionArtifactTable.kind, id: ProjectDeletionArtifactTable.artifact_id })
@@ -722,11 +742,23 @@ describe("global project delete endpoint", () => {
           (yield* db.select().from(ProjectTable).all().pipe(Effect.orDie)).some((row) => row.id === project.id),
         ).toBe(false)
         expect(yield* fs.exists(worktree)).toBe(false)
+        expect(yield* fs.exists(legacyWorktree)).toBe(false)
         expect(yield* fs.exists(artifact)).toBe(false)
         expect(yield* fs.exists(sessionDiffArtifact)).toBe(false)
         expect(yield* fs.exists(messageArtifact)).toBe(false)
         expect(yield* fs.exists(partArtifact)).toBe(false)
         expect(yield* fs.exists(sibling)).toBe(true)
+        expect(
+          yield* db
+            .select()
+            .from(EventSequenceTable)
+            .where(eq(EventSequenceTable.aggregate_id, session.id))
+            .get()
+            .pipe(Effect.orDie),
+        ).toBeUndefined()
+        expect((yield* Effect.promise(() => $`git show-ref --verify --quiet refs/heads/deletion-retry`.cwd(tmp.directory).quiet().nothrow())).exitCode).not.toBe(0)
+        expect((yield* Effect.promise(() => $`git show-ref --verify --quiet refs/heads/deletion-legacy`.cwd(tmp.directory).quiet().nothrow())).exitCode).not.toBe(0)
+        expect((yield* Effect.promise(() => $`git show-ref --verify --quiet refs/heads/deletion-sibling`.cwd(tmp.directory).quiet().nothrow())).exitCode).toBe(0)
         expect(yield* db.select().from(ProjectDeletionJobTable).all().pipe(Effect.orDie)).toEqual([])
         expect(yield* db.select().from(ProjectDeletionWorktreeTable).all().pipe(Effect.orDie)).toEqual([])
         expect(yield* db.select().from(ProjectDeletionArtifactTable).all().pipe(Effect.orDie)).toEqual([])
@@ -786,6 +818,51 @@ describe("global project delete endpoint", () => {
         expect(
           events.seen.filter((event) => event.payload.type === "sync" && event.payload.syncEvent?.id === eventID),
         ).toHaveLength(1)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "records manual reconciliation before touching rows or files for malformed legacy metadata",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const fs = yield* FSUtil.Service
+        const current = yield* requestInDirectory("/project/current", tmp.directory)
+        const project = (yield* current.json) as { id: ProjectV2.ID }
+        const created = yield* requestInDirectory("/session", tmp.directory, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        })
+        const session = (yield* created.json) as { id: SessionID }
+        const malformed = "../outside"
+        const sentinel = path.join(tmp.directory, "manual-reconciliation-sentinel")
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(ProjectDeletionArtifactTable)
+          .values({ project_id: project.id, kind: "message", artifact_id: malformed })
+          .run()
+          .pipe(Effect.orDie)
+        yield* Effect.promise(() => Bun.write(sentinel, "do not touch"))
+
+        const response = yield* request(`/global/project/${project.id}`, { method: "DELETE" })
+        expect(response.status).toBe(409)
+        expect(yield* fs.exists(sentinel)).toBe(true)
+        expect(
+          yield* db.select().from(SessionTable).where(eq(SessionTable.id, session.id)).get().pipe(Effect.orDie),
+        ).toBeDefined()
+        expect(
+          yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, project.id)).get().pipe(Effect.orDie),
+        ).toBeDefined()
+        expect(
+          (yield* db
+            .select({ error: ProjectDeletionJobTable.last_error })
+            .from(ProjectDeletionJobTable)
+            .where(eq(ProjectDeletionJobTable.project_id, project.id))
+            .get()
+            .pipe(Effect.orDie))?.error,
+        ).toContain("legacy_artifact_manual_reconciliation")
       }),
     { git: true },
   )

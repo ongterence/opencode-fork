@@ -6,6 +6,7 @@ import {
   UnsafeLegacyMetadataError,
   deletionTarget,
   legacyDeletionTarget,
+  ownedProjectWorktreeTarget,
   ownedWorktreeTarget,
   opaqueStorageKey,
   requireLegacyLeaf,
@@ -100,6 +101,25 @@ describe("project removal paths", () => {
         candidate: winRoot.replace("C:\\Data", "c:\\data") + "\\ws_a",
       }),
     ).toBe(winRoot.toLowerCase() + "\\ws_a")
+  })
+
+  test("accepts contained legacy worktrees without treating a sibling as owned", () => {
+    expect(
+      ownedProjectWorktreeTarget({
+        pathApi: path.posix,
+        dataRoot: "/data",
+        projectID: "proj_legacy",
+        candidate: "/data/worktree/proj_legacy/ws_a",
+      }),
+    ).toBe("/data/worktree/proj_legacy/ws_a")
+    expect(() =>
+      ownedProjectWorktreeTarget({
+        pathApi: path.posix,
+        dataRoot: "/data",
+        projectID: "proj_legacy",
+        candidate: "/data/worktree/proj_legacy-personal/ws_a",
+      }),
+    ).toThrow()
   })
 
   test("maps ordinary legacy identities to the established storage layout", () => {

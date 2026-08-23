@@ -31,7 +31,12 @@ import { InstanceStore } from "./instance-store"
 import * as Project from "./project"
 import { ProjectDeletingError, ProjectDeletionCoordinator } from "./deletion-coordinator"
 import { NotRemovableError } from "./project-errors"
-import { UnsafeLegacyMetadataError, deletionTarget, legacyDeletionTarget, ownedWorktreeTarget } from "./removal-paths"
+import {
+  UnsafeLegacyMetadataError,
+  deletionTarget,
+  legacyDeletionTarget,
+  ownedProjectWorktreeTarget,
+} from "./removal-paths"
 
 export { NotRemovableError } from "./project-errors"
 
@@ -142,7 +147,10 @@ const layer = Layer.effect(
     // and must be stopped before the worktree directory can be removed.
     const stopFsmonitor = Effect.fnUntraced(function* (target: string) {
       if (!existsSync(target)) return
-      yield* git(["fsmonitor--daemon", "stop"], target)
+      const stopped = yield* git(["fsmonitor--daemon", "stop"], target)
+      if (stopped.code === 0) return
+      if ((stopped.stderr || stopped.text).includes("fsmonitor--daemon is not running")) return
+      return yield* Effect.fail(new Error(`git fsmonitor stop failed for ${target}: ${stopped.stderr || stopped.text}`))
     })
 
     // Opencode-created sandbox worktrees register admin entries inside the user's
@@ -164,7 +172,7 @@ const layer = Layer.effect(
             entry.path,
             Effect.try({
               try: () => ({
-                canonical_path: ownedWorktreeTarget({
+                canonical_path: ownedProjectWorktreeTarget({
                   pathApi: path,
                   dataRoot: Global.Path.data,
                   projectID,
@@ -187,7 +195,7 @@ const layer = Layer.effect(
             return [
               [
                 identity(
-                  ownedWorktreeTarget({
+                  ownedProjectWorktreeTarget({
                     pathApi: path,
                     dataRoot: Global.Path.data,
                     projectID,
@@ -202,9 +210,32 @@ const layer = Layer.effect(
           }
         }),
       )
-      for (const entry of owned) {
+      const prepared = yield* Effect.forEach(owned, (entry) => {
         const listedEntry = listedByPath.get(identity(entry.canonical_path))
-        if (!listedEntry) {
+        const discoveredBranch = listedEntry?.branch?.replace(/^refs\/heads\//, "")
+        if (entry.branch && discoveredBranch && entry.branch !== discoveredBranch)
+          return Effect.fail(new Error(`worktree branch changed for ${entry.canonical_path}`))
+        const branch = entry.branch ?? discoveredBranch ?? null
+        if (branch === entry.branch) return Effect.succeed({ ...entry, branch, listed: Boolean(listedEntry) })
+        return db
+          .transaction(
+            (tx) =>
+              tx
+                .update(ProjectDeletionWorktreeTable)
+                .set({ branch, updated_at: Date.now() })
+                .where(
+                  and(
+                    eq(ProjectDeletionWorktreeTable.project_id, projectID),
+                    eq(ProjectDeletionWorktreeTable.canonical_path, entry.canonical_path),
+                  ),
+                )
+                .run(),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie, Effect.as({ ...entry, branch, listed: Boolean(listedEntry) }))
+      })
+      for (const entry of prepared) {
+        if (!entry.listed) {
           yield* required("worktree_rm", entry.canonical_path, rmPath(entry.canonical_path))
           continue
         }
@@ -221,7 +252,7 @@ const layer = Layer.effect(
             if (!candidate.path) return false
             try {
               return identity(
-                ownedWorktreeTarget({
+                ownedProjectWorktreeTarget({
                   pathApi: path,
                   dataRoot: Global.Path.data,
                   projectID,
@@ -247,7 +278,7 @@ const layer = Layer.effect(
           try {
             return [
               identity(
-                ownedWorktreeTarget({ pathApi: path, dataRoot: Global.Path.data, projectID, candidate: entry.path }),
+                ownedProjectWorktreeTarget({ pathApi: path, dataRoot: Global.Path.data, projectID, candidate: entry.path }),
               ),
             ]
           } catch {
@@ -255,11 +286,13 @@ const layer = Layer.effect(
           }
         }),
       )
-      for (const entry of owned) {
+      for (const entry of prepared) {
         if (!entry.branch || remaining.has(identity(entry.canonical_path))) continue
-        const deleted = yield* git(["branch", "-D", entry.branch], info.worktree)
-        if (deleted.code !== 0)
-          return yield* Effect.fail(new Error(`worktree branch delete failed for ${entry.branch}: ${deleted.stderr}`))
+        const deleted = yield* git(["branch", "-D", "--", entry.branch], info.worktree)
+        if (deleted.code === 0) continue
+        const present = yield* git(["show-ref", "--verify", "--quiet", `refs/heads/${entry.branch}`], info.worktree)
+        if (present.code === 1) continue
+        return yield* Effect.fail(new Error(`worktree branch delete failed for ${entry.branch}: ${deleted.stderr || deleted.text}`))
       }
     })
 
@@ -281,24 +314,88 @@ const layer = Layer.effect(
       )
     })
 
-    const purgeScoped = Effect.fn("ProjectRemoval.purgeScoped")(function* (
+    const preflightLocalCleanup = Effect.fn("ProjectRemoval.preflightLocalCleanup")(function* (
       projectID: ProjectV2.ID,
       info: Project.Info,
     ) {
-      // Collect everything owned by the project before any deletion.
-      const sessions = yield* db
-        .select({ id: SessionTable.id, parentID: SessionTable.parent_id })
-        .from(SessionTable)
-        .where(eq(SessionTable.project_id, projectID))
-        .all()
-        .pipe(Effect.orDie)
-      const sessionIDs = new Set(sessions.map((entry) => entry.id))
-      const ids = [...sessionIDs]
-
       const artifacts = yield* db
         .select({ kind: ProjectDeletionArtifactTable.kind, id: ProjectDeletionArtifactTable.artifact_id })
         .from(ProjectDeletionArtifactTable)
         .where(eq(ProjectDeletionArtifactTable.project_id, projectID))
+        .all()
+        .pipe(Effect.orDie)
+      const worktrees = yield* db
+        .select({ path: ProjectDeletionWorktreeTable.canonical_path })
+        .from(ProjectDeletionWorktreeTable)
+        .where(eq(ProjectDeletionWorktreeTable.project_id, projectID))
+        .all()
+        .pipe(Effect.orDie)
+
+      yield* Effect.all(
+        [
+          legacyTarget("worktree", info.id, undefined),
+          legacyTarget("snapshot", info.id, undefined),
+          legacyTarget("storage-project", info.id, undefined),
+          legacyTarget("storage-session", info.id, undefined),
+          required(
+            "snapshot",
+            projectID,
+            Effect.try({
+              try: () => deletionTarget({ pathApi: path, dataRoot: Global.Path.data, category: "snapshot", projectID }),
+              catch: (cause) => cause,
+            }),
+          ),
+          Effect.forEach(
+            artifacts,
+            (artifact) =>
+              legacyTarget(
+                artifact.kind === "session_diff"
+                  ? "storage-session-diff"
+                  : artifact.kind === "message"
+                    ? "storage-message"
+                    : "storage-part",
+                undefined,
+                artifact.id,
+              ),
+            { discard: true },
+          ),
+          Effect.forEach(
+            worktrees,
+            (worktree) =>
+              required(
+                "worktree_snapshot",
+                worktree.path,
+                Effect.try({
+                  try: () =>
+                    ownedProjectWorktreeTarget({
+                      pathApi: path,
+                      dataRoot: Global.Path.data,
+                      projectID,
+                      candidate: worktree.path,
+                    }),
+                  catch: (cause) => cause,
+                }),
+              ),
+            { discard: true },
+          ),
+        ],
+        { concurrency: 1, discard: true },
+      )
+      return artifacts
+    })
+
+    const purgeScoped = Effect.fn("ProjectRemoval.purgeScoped")(function* (
+      projectID: ProjectV2.ID,
+      info: Project.Info,
+      artifacts: ReadonlyArray<{ kind: "session_diff" | "message" | "part"; id: string }>,
+    ) {
+      // Use the immutable session artifact snapshot: Session.remove may have
+      // already deleted live rows before a later required cleanup retry.
+      const ids = artifacts.filter((artifact) => artifact.kind === "session_diff").map((artifact) => artifact.id)
+      const sessions = yield* db
+        .select({ id: SessionTable.id, parentID: SessionTable.parent_id })
+        .from(SessionTable)
+        .where(eq(SessionTable.project_id, projectID))
         .all()
         .pipe(Effect.orDie)
 
@@ -351,7 +448,6 @@ const layer = Layer.effect(
       // external cleanup has completed. A failed cleanup can then reconstruct
       // the same target set instead of mistaking a missing row for success.
       yield* removeGitWorktrees(projectID, info)
-      yield* legacyTarget("worktree", info.id, undefined).pipe(Effect.flatMap((target) => required("legacy_worktree", info.id, rmPath(target))))
       yield* legacyTarget("snapshot", info.id, undefined).pipe(Effect.flatMap((target) => required("legacy_snapshot", info.id, rmPath(target))))
       yield* legacyTarget("storage-project", info.id, undefined).pipe(
         Effect.flatMap((target) => required("legacy_project_storage", info.id, rmPath(target))),
@@ -462,7 +558,7 @@ const layer = Layer.effect(
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       if (!row) return
       const info = Project.fromRow(row)
-      yield* purgeScoped(projectID, info)
+      yield* purgeScoped(projectID, info, yield* preflightLocalCleanup(projectID, info))
     })
 
     const cleanup = (projectID: ProjectV2.ID) =>
