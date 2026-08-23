@@ -1,6 +1,7 @@
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import { app } from "electron"
+import { isUpdaterEnabled } from "./updater-controller"
 
 type Channel = "dev" | "beta" | "prod"
 const raw = import.meta.env.OPENCODE_CHANNEL
@@ -16,4 +17,22 @@ export const APP_IDS: Record<Channel, string> = {
 // locally built package is not auto-replaced by an official release.
 const UPDATES_DISABLED_MARKER = join(app.getPath("appData"), APP_IDS[CHANNEL], ".disable-updates")
 
-export const UPDATER_ENABLED = app.isPackaged && CHANNEL !== "dev" && !existsSync(UPDATES_DISABLED_MARKER)
+const forkUpdate = (() => {
+  if (!app.isPackaged) return false
+  try {
+    const value = JSON.parse(readFileSync(join(app.getAppPath(), "package.json"), "utf8")) as { forkUpdate?: unknown }
+    return value.forkUpdate === true
+  } catch {
+    return false
+  }
+})()
+
+export const FORK_UPDATE = forkUpdate
+export const UPDATER_ENABLED = isUpdaterEnabled({
+  packaged: app.isPackaged,
+  channel: CHANNEL,
+  updatesDisabled: existsSync(UPDATES_DISABLED_MARKER),
+  forkUpdate,
+  platform: process.platform,
+  currentVersion: app.getVersion(),
+})

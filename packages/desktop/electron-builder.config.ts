@@ -39,6 +39,22 @@ const channel = (() => {
 // so electron-updater checks the fork's channel instead of the official one.
 const publishOwner = process.env.OPENCODE_PUBLISH_OWNER ?? "anomalyco"
 const publishRepo = process.env.OPENCODE_PUBLISH_REPO ?? "opencode"
+const forkUpdate = process.env.OPENCODE_FORK_UPDATE === "true"
+const publisherName = process.env.OPENCODE_WINDOWS_PUBLISHER_NAME
+
+if (forkUpdate) {
+  if (process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true")
+    throw new Error("Fork packages may only be produced by the GitHub Actions Windows signing job")
+  const required = [
+    "AZURE_TRUSTED_SIGNING_ENDPOINT",
+    "AZURE_TRUSTED_SIGNING_ACCOUNT_NAME",
+    "AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE",
+    "OPENCODE_WINDOWS_PUBLISHER_NAME",
+    "OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT",
+  ]
+  const missing = required.filter((name) => !process.env[name])
+  if (missing.length) throw new Error(`Fork packaging requires signing identity variables: ${missing.join(", ")}`)
+}
 
 const APP_IDS = {
   dev: "ai.opencode.desktop.dev",
@@ -59,6 +75,7 @@ const getBase = (appId: string): Configuration => ({
   // https://www.electron.build/docs/linux/
   extraMetadata: {
     desktopName: `${appId}.desktop`,
+    forkUpdate,
   },
   files: ["out/**/*", "resources/**/*", "!resources/opencode-cli*"],
   extraResources: [
@@ -96,11 +113,12 @@ const getBase = (appId: string): Configuration => ({
   },
   win: {
     icon: `resources/icons/icon.ico`,
+    publisherName: publisherName ? [publisherName] : undefined,
     signtoolOptions: {
       sign: signWindows,
     },
     target: ["nsis"],
-    verifyUpdateCodeSignature: false,
+    verifyUpdateCodeSignature: true,
   },
   nsis: {
     oneClick: true,

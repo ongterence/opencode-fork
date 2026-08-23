@@ -4,16 +4,40 @@ export type { UpdaterState } from "@opencode-ai/app/updater"
 
 export type UpdaterReadyRecord = { version: string }
 
+export type ForkVersion = `${number}.${number}.${number}-fork.${number}`
+
+const forkVersionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-fork\.([1-9]\d*)$/
+
+export function requireNewerVersion(candidate: string, current: string) {
+  const next = candidate.match(forkVersionPattern)?.slice(1).map(BigInt)
+  const installed = current.match(forkVersionPattern)?.slice(1).map(BigInt)
+  if (!next || !installed) return false
+  const difference = next.findIndex((value, index) => value !== installed[index])
+  if (difference === -1) return false
+  return next[difference]! > installed[difference]!
+}
+
+export function isUpdaterEnabled(input: {
+  packaged: boolean
+  channel: "dev" | "beta" | "prod"
+  updatesDisabled: boolean
+  forkUpdate: boolean
+  platform: NodeJS.Platform
+  currentVersion: string
+}) {
+  if (!input.packaged || input.channel === "dev" || input.updatesDisabled) return false
+  if (!input.forkUpdate) return true
+  if (input.platform !== "win32") return false
+  return forkVersionPattern.test(input.currentVersion)
+}
+
 export type LocalServerConnection = {
   url: string
   username: string | null
   password: string | null
 }
 
-export async function prepareServerShutdown(
-  connection: LocalServerConnection,
-  fetcher: typeof fetch = fetch,
-) {
+export async function prepareServerShutdown(connection: LocalServerConnection, fetcher: typeof fetch = fetch) {
   const headers = new Headers()
   if (connection.username !== null && connection.password !== null)
     headers.set("authorization", `Basic ${btoa(`${connection.username}:${connection.password}`)}`)
@@ -52,6 +76,7 @@ type UpdaterPersistence = {
 
 export function createUpdaterController(input: {
   enabled: boolean
+  forkUpdate: boolean
   currentVersion: string
   backend: UpdaterBackend
   persistence: UpdaterPersistence
@@ -79,7 +104,12 @@ export function createUpdaterController(input: {
       transition({ status: "checking" })
       const result = await input.backend.checkForUpdates()
       const version = result?.updateInfo?.version
-      if (!result?.isUpdateAvailable || !version || version === input.currentVersion) {
+      if (
+        !result?.isUpdateAvailable ||
+        !version ||
+        version === input.currentVersion ||
+        (input.forkUpdate && !requireNewerVersion(version, input.currentVersion))
+      ) {
         await input.persistence.clear()
         return transition({ status: "up-to-date" })
       }

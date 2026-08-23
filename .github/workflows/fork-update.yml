@@ -1,29 +1,156 @@
 name: Fork update build
 
-# Merges upstream dev into the fork's main, builds the Windows installer with
-# the fork's update feed (this repo), and publishes it as a GitHub release so
-# electron-updater in installed fork builds can self-update.
-
 on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Known-good ref to rebuild as a newer rollback release"
+        required: true
+        type: string
+      reason:
+        description: "Reason for promoting this known-good source"
+        required: true
+        type: string
 
 concurrency:
   group: fork-update
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  actions: read
+  contents: read
 
 jobs:
-  windows:
+  source:
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      publish: ${{ steps.source.outputs.publish }}
+      source_ref: ${{ steps.source.outputs.source_ref }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      reason: ${{ steps.source.outputs.reason }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'main' }}
+
+      - name: Git identity
+        run: |
+          git config user.name "fork-update-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Resolve source
+        id: source
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
+          INPUT_REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            git remote add upstream https://github.com/anomalyco/opencode.git 2>/dev/null || true
+            git fetch upstream dev
+            behind=$(git rev-list --count HEAD..refs/remotes/upstream/dev)
+            if [ "$behind" = "0" ]; then
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "No upstream commits to promote"
+              exit 0
+            fi
+            git merge refs/remotes/upstream/dev --no-edit
+            git push origin HEAD:main
+            source_ref="upstream/dev"
+            reason="Scheduled upstream synchronization"
+          else
+            git fetch origin main
+            if ! git merge-base --is-ancestor HEAD origin/main; then
+              echo "Rollback source must be an immutable commit in origin/main history" >&2
+              exit 1
+            fi
+            source_ref="$INPUT_SOURCE_REF"
+            reason="$INPUT_REASON"
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "source_ref<<SOURCE_REF_EOF"
+            echo "$source_ref"
+            echo "SOURCE_REF_EOF"
+            echo "reason<<REASON_EOF"
+            echo "$reason"
+            echo "REASON_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Derive immutable fork version
+        if: steps.source.outputs.publish == 'true'
+        id: version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            git fetch origin main
+            upstream=$(git show origin/main:packages/desktop/package.json | node -e "let source = ''; process.stdin.on('data', (chunk) => source += chunk); process.stdin.on('end', () => console.log(JSON.parse(source).version))")
+          else
+            upstream=$(node -p "require('./packages/desktop/package.json').version")
+          fi
+          if ! [[ "$upstream" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Upstream desktop version is not major.minor.patch: $upstream" >&2
+            exit 1
+          fi
+          latest=$(git ls-remote --tags origin "refs/tags/v*-fork.*" | sed 's#.*refs/tags/v##' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-fork\.[1-9][0-9]*$' | sort -V | tail -1 || true)
+          if [ -n "$latest" ]; then
+            latest_base=${latest%%-fork.*}
+            upstream=$(printf '%s\n%s\n' "$upstream" "$latest_base" | sort -V | tail -1)
+          fi
+          version="${upstream}-fork.${GITHUB_RUN_NUMBER}"
+          if [ -n "$latest" ] && { [ "$version" = "$latest" ] || [ "$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -1)" != "$version" ]; }; then
+            echo "Derived version $version is not newer than existing fork release $latest" >&2
+            exit 1
+          fi
+          tag="v${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Refusing to reuse existing tag ${tag}" >&2
+            exit 1
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing release ${tag}" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Prepared immutable release $tag"
+
+  validate:
+    needs: source
+    if: needs.source.outputs.publish == 'true'
+    runs-on: windows-latest
+    environment: fork-update-signing
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+      AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE }}
+      OPENCODE_WINDOWS_PUBLISHER_NAME: ${{ vars.OPENCODE_WINDOWS_PUBLISHER_NAME }}
+      OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.source.outputs.source_sha }}
 
       - uses: ./.github/actions/setup-bun
 
@@ -31,70 +158,169 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Git identity
-        run: |
-          git config user.name "fork-update-bot"
-          git config user.email "actions@users.noreply.github.com"
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Sync upstream
-        id: sync
-        shell: bash
-        run: |
-          set -e
-          git remote add upstream https://github.com/anomalyco/opencode.git 2>/dev/null || true
-          git fetch upstream dev
-          BEHIND=$(git rev-list --count main..refs/remotes/upstream/dev)
-          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
-          echo "main is $BEHIND commits behind upstream/dev"
-          if [ "$BEHIND" -gt 0 ]; then
-            git merge refs/remotes/upstream/dev --no-edit
-            git push origin main
-          fi
-
-      - name: Version
-        if: steps.sync.outputs.behind != '0'
-        id: version
-        shell: bash
-        run: echo "version=$(node -p "require('./packages/desktop/package.json').version")" >> "$GITHUB_OUTPUT"
-
-      # electron-builder fails publishing into an existing release; the fork may
-      # rebuild the same upstream version several times between official bumps.
-      - name: Replace same-version release
-        if: steps.sync.outputs.behind != '0'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release delete "v${{ steps.version.outputs.version }}" --yes --cleanup-tag 2>/dev/null || true
-
-      - name: Install dependencies
-        if: steps.sync.outputs.behind != '0'
-        run: bun install
-
-      - name: Prepare
-        if: steps.sync.outputs.behind != '0'
-        run: bun ./scripts/prepare.ts
+      - name: Prepare fork package
         working-directory: packages/desktop
+        run: bun ./scripts/prepare.ts
         env:
-          OPENCODE_VERSION: ${{ steps.version.outputs.version }}
+          OPENCODE_VERSION: ${{ needs.source.outputs.version }}
           OPENCODE_CHANNEL: prod
           RUST_TARGET: x86_64-pc-windows-msvc
 
-      - name: Build
-        if: steps.sync.outputs.behind != '0'
-        run: bun run build
+      - name: Validate source and package
         working-directory: packages/desktop
+        timeout-minutes: 60
+        run: |
+          bun test src/main/updater-controller.test.ts src/main/updater.test.ts
+          bun typecheck
+          bun run build
+          npx electron-builder --win --publish never --config electron-builder.config.ts
         env:
           NODE_OPTIONS: --max-old-space-size=4096
           OPENCODE_CHANNEL: prod
-
-      - name: Package + publish release
-        if: steps.sync.outputs.behind != '0'
-        run: npx electron-builder --win --publish always --config electron-builder.config.ts
-        working-directory: packages/desktop
-        timeout-minutes: 60
-        env:
-          OPENCODE_CHANNEL: prod
+          OPENCODE_FORK_UPDATE: "true"
           OPENCODE_PUBLISH_OWNER: ${{ github.repository_owner }}
           OPENCODE_PUBLISH_REPO: ${{ github.event.repository.name }}
+
+      - name: Verify installer signature and update hash
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem "packages/desktop/dist/*.exe" -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Windows installer, found $($installers.Count)"
+          }
+          $installer = $installers[0]
+          $signature = Get-AuthenticodeSignature $installer.FullName
+          if ($signature.Status -ne "Valid") {
+            throw "Invalid installer signature: $($signature.Status)"
+          }
+          $thumbprint = $signature.SignerCertificate.Thumbprint.Replace(" ", "").ToUpperInvariant()
+          $approvedThumbprint = $env:OPENCODE_WINDOWS_CERTIFICATE_THUMBPRINT.Replace(" ", "").ToUpperInvariant()
+          if ($thumbprint -ne $approvedThumbprint) {
+            throw "Installer certificate thumbprint is not approved"
+          }
+          if ($signature.SignerCertificate.Subject -ne $env:OPENCODE_WINDOWS_PUBLISHER_NAME) {
+            throw "Installer publisher does not match the approved identity"
+          }
+
+          $metadataPath = "packages/desktop/dist/latest.yml"
+          if (-not (Test-Path $metadataPath)) {
+            throw "latest.yml was not produced"
+          }
+          $lines = Get-Content $metadataPath
+          $urlIndex = [Array]::FindIndex($lines, [Predicate[string]] { param($line) $line.Trim() -eq "- url: $($installer.Name)" })
+          if ($urlIndex -lt 0) {
+            throw "latest.yml does not name $($installer.Name)"
+          }
+          $shaLine = $lines[($urlIndex + 1)..([Math]::Min($urlIndex + 4, $lines.Count - 1))] |
+            Where-Object { $_.Trim().StartsWith("sha512:") } |
+            Select-Object -First 1
+          if (-not $shaLine) {
+            throw "latest.yml has no SHA-512 for $($installer.Name)"
+          }
+          $expected = $shaLine.Trim().Substring("sha512:".Length).Trim()
+          $sha512 = [System.Security.Cryptography.SHA512]::Create()
+          try {
+            $actual = [Convert]::ToBase64String($sha512.ComputeHash([IO.File]::ReadAllBytes($installer.FullName)))
+          }
+          finally {
+            $sha512.Dispose()
+          }
+          if ($actual -ne $expected) {
+            throw "latest.yml SHA-512 does not match $($installer.Name)"
+          }
+
+          Get-ChildItem "packages/desktop/dist" -File |
+            Where-Object { $_.Extension -in ".exe", ".blockmap" -or $_.Name -eq "latest.yml" } |
+            ForEach-Object { "$(Get-FileHash $_.FullName -Algorithm SHA512 | Select-Object -ExpandProperty Hash)  $($_.Name)" } |
+            Set-Content "packages/desktop/dist/SHA512SUMS.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fork-update-${{ needs.source.outputs.version }}
+          if-no-files-found: error
+          path: |
+            packages/desktop/dist/*.exe
+            packages/desktop/dist/*.blockmap
+            packages/desktop/dist/latest.yml
+            packages/desktop/dist/SHA512SUMS.txt
+
+  promote:
+    needs:
+      - source
+      - validate
+    if: needs.source.outputs.publish == 'true'
+    runs-on: windows-latest
+    environment: fork-update-production
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: fork-update-${{ needs.source.outputs.version }}
+          path: release-assets
+
+      - name: Promote immutable release
+        shell: pwsh
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.source.outputs.version }}
+          SOURCE_REF: ${{ needs.source.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.source.outputs.source_sha }}
+          REASON: ${{ needs.source.outputs.reason }}
+        run: |
+          $tag = "v$env:VERSION"
+          git fetch origin --tags
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to refresh remote tags"
+          }
+          $existingTag = git ls-remote --tags origin "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect remote tag $tag"
+          }
+          if ($existingTag) {
+            throw "Refusing to reuse existing tag $tag"
+          }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Refusing to overwrite existing release $tag"
+          }
+
+          $notes = @"
+          Source ref: $env:SOURCE_REF
+          Source commit: $env:SOURCE_SHA
+          Reason: $env:REASON
+
+          This immutable Windows fork release passed updater tests, type checking, build, Authenticode publisher/thumbprint verification, and latest.yml SHA-512 verification before promotion.
+          "@
+          $notes | Set-Content "$env:RUNNER_TEMP/release-notes.md"
+          $assets = @(Get-ChildItem "release-assets" -File | Select-Object -ExpandProperty FullName)
+          if ($assets.Count -lt 3) {
+            throw "Validated release assets are incomplete"
+          }
+
+          gh release create $tag @assets `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "OpenCode $env:VERSION" `
+            --notes-file "$env:RUNNER_TEMP/release-notes.md" `
+            --draft
+          if ($LASTEXITCODE -ne 0) {
+            throw "Draft release creation failed"
+          }
+          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          if ($LASTEXITCODE -ne 0) {
+            throw "Protected release promotion failed; the draft remains invisible to update clients"
+          }
