@@ -24,6 +24,43 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`project_deletion_job\` (
+          \`project_id\` text PRIMARY KEY,
+          \`phase\` text NOT NULL,
+          \`attempt\` integer NOT NULL,
+          \`last_error\` text,
+          \`created_at\` integer NOT NULL,
+          \`updated_at\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`project_deletion_share\` (
+          \`project_id\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          \`share_id\` text NOT NULL,
+          \`secret\` text NOT NULL,
+          \`base_url\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`attempt\` integer NOT NULL,
+          \`last_error\` text,
+          \`created_at\` integer NOT NULL,
+          \`updated_at\` integer NOT NULL,
+          CONSTRAINT \`project_deletion_share_pk\` PRIMARY KEY(\`project_id\`, \`session_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`project_deletion_worktree\` (
+          \`project_id\` text NOT NULL,
+          \`canonical_path\` text NOT NULL,
+          \`branch\` text,
+          \`attempt\` integer NOT NULL,
+          \`last_error\` text,
+          \`created_at\` integer NOT NULL,
+          \`updated_at\` integer NOT NULL,
+          CONSTRAINT \`project_deletion_worktree_pk\` PRIMARY KEY(\`project_id\`, \`canonical_path\`)
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`account_state\` (
           \`id\` integer PRIMARY KEY,
           \`active_account_id\` text,
@@ -236,6 +273,8 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(`CREATE INDEX \`project_deletion_job_phase_idx\` ON \`project_deletion_job\` (\`phase\`);`)
+      yield* tx.run(`CREATE INDEX \`project_deletion_share_status_idx\` ON \`project_deletion_share\` (\`status\`);`)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(
