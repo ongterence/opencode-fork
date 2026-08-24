@@ -130,6 +130,42 @@ test("writes the approved Windows publisher into release update metadata", async
   }
 })
 
+test("allows unsigned fork packaging on GitHub Actions without a publisher", async () => {
+  const previousChannel = process.env.OPENCODE_CHANNEL
+  const previousGithubActions = process.env.GITHUB_ACTIONS
+  const previousForkUpdate = process.env.OPENCODE_FORK_UPDATE
+  const previousForkStage = process.env.OPENCODE_FORK_PACKAGE_STAGE
+  const previousWorkflowRef = process.env.GITHUB_WORKFLOW_REF
+  const previousPublisherName = process.env.OPENCODE_WINDOWS_PUBLISHER_NAME
+  process.env.OPENCODE_CHANNEL = "prod"
+  process.env.GITHUB_ACTIONS = "true"
+  process.env.OPENCODE_FORK_UPDATE = "true"
+  process.env.OPENCODE_FORK_PACKAGE_STAGE = "unsigned"
+  process.env.GITHUB_WORKFLOW_REF = "ongterence/opencode-fork/.github/workflows/fork-update.yml@refs/heads/main"
+  delete process.env.OPENCODE_WINDOWS_PUBLISHER_NAME
+
+  try {
+    const module = await import("./electron-builder.config.ts?fork-unsigned-policy")
+    const config = module.default as Configuration
+
+    expect(config.win?.verifyUpdateCodeSignature).toBe(false)
+    expect(config.win?.signtoolOptions?.publisherName).toBeUndefined()
+  } finally {
+    if (previousChannel === undefined) delete process.env.OPENCODE_CHANNEL
+    else process.env.OPENCODE_CHANNEL = previousChannel
+    if (previousGithubActions === undefined) delete process.env.GITHUB_ACTIONS
+    else process.env.GITHUB_ACTIONS = previousGithubActions
+    if (previousForkUpdate === undefined) delete process.env.OPENCODE_FORK_UPDATE
+    else process.env.OPENCODE_FORK_UPDATE = previousForkUpdate
+    if (previousForkStage === undefined) delete process.env.OPENCODE_FORK_PACKAGE_STAGE
+    else process.env.OPENCODE_FORK_PACKAGE_STAGE = previousForkStage
+    if (previousWorkflowRef === undefined) delete process.env.GITHUB_WORKFLOW_REF
+    else process.env.GITHUB_WORKFLOW_REF = previousWorkflowRef
+    if (previousPublisherName === undefined) delete process.env.OPENCODE_WINDOWS_PUBLISHER_NAME
+    else process.env.OPENCODE_WINDOWS_PUBLISHER_NAME = previousPublisherName
+  }
+})
+
 for (const channel of ["beta", "prod"] as const) {
   test(`does not bundle the CLI in ${channel} builds`, async () => {
     const previous = process.env.OPENCODE_CHANNEL

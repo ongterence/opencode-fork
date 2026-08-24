@@ -45,7 +45,7 @@ const forkUpdate = process.env.OPENCODE_FORK_UPDATE === "true"
 const publisherName = process.env.OPENCODE_WINDOWS_PUBLISHER_NAME
 const releaseChannel = channel === "beta" || channel === "prod"
 
-if (process.platform === "win32" && releaseChannel && process.env.GITHUB_ACTIONS === "true" && !publisherName) {
+if (!forkUpdate && process.platform === "win32" && releaseChannel && process.env.GITHUB_ACTIONS === "true" && !publisherName) {
   throw new Error("Release packaging requires OPENCODE_WINDOWS_PUBLISHER_NAME")
 }
 
@@ -56,9 +56,6 @@ if (forkUpdate) {
     throw new Error("Fork packaging must use the isolated unsigned artifact stage")
   if (!process.env.GITHUB_WORKFLOW_REF?.includes("/.github/workflows/fork-update.yml@"))
     throw new Error("Fork packaging is restricted to the immutable fork update workflow")
-  const required = ["OPENCODE_WINDOWS_PUBLISHER_NAME"]
-  const missing = required.filter((name) => !process.env[name])
-  if (missing.length) throw new Error(`Fork packaging requires signing identity variables: ${missing.join(", ")}`)
 }
 
 const APP_IDS = {
@@ -123,7 +120,7 @@ const getBase = (appId: string): Configuration => ({
       publisherName: publisherName ? [publisherName] : undefined,
     },
     target: ["nsis"],
-    verifyUpdateCodeSignature: true,
+    verifyUpdateCodeSignature: !forkUpdate,
   },
   nsis: {
     oneClick: true,
