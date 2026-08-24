@@ -130,7 +130,7 @@ test("writes the approved Windows publisher into release update metadata", async
   }
 })
 
-test("allows unsigned fork packaging on GitHub Actions without a publisher", async () => {
+test.skipIf(process.platform !== "win32")("allows unsigned fork packaging on GitHub Actions without a publisher", async () => {
   const previousChannel = process.env.OPENCODE_CHANNEL
   const previousGithubActions = process.env.GITHUB_ACTIONS
   const previousForkUpdate = process.env.OPENCODE_FORK_UPDATE
