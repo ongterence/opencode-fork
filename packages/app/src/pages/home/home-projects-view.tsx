@@ -18,6 +18,7 @@ import { usePlatform } from "@/context/platform"
 import { displayName, getProjectAvatarSource } from "@/pages/layout/helpers"
 import { ServerRowMenuView, serverMenuLabels } from "@/components/server/server-row-menu"
 import { ServerHealthIndicator } from "@/components/server/server-row"
+import { useUpdaterAction } from "@/components/updater-action"
 import { type ServerHealth } from "@/utils/server-health"
 import { fileManagerApp } from "@/utils/file-manager"
 
@@ -161,6 +162,14 @@ export function HomeUtilityNav(props: {
   onOpenHelp: () => void
   language: ReturnType<typeof useLanguage>
 }) {
+  const platform = usePlatform()
+  const updater = useUpdaterAction()
+  const label = createMemo(() => {
+    const status = platform.updater?.state()?.status
+    if (status === "checking" || status === "downloading" || status === "installing" || status === "ready")
+      return updater.action().label
+    return "desktop.menu.updateOpencode"
+  })
   return (
     <div class={`${props.class ?? ""} min-w-0 flex-col gap-1 pr-3`}>
       <HomeProjectNavButton
@@ -171,6 +180,16 @@ export function HomeUtilityNav(props: {
         <IconV2 name="settings-gear" size="small" />
         <span class={HOME_PROJECT_NAV_LABEL}>{props.language.t("sidebar.settings")}</span>
       </HomeProjectNavButton>
+      <Show when={platform.updater}>
+        <HomeProjectNavButton
+          type="button"
+          class="text-v2-text-text-faint [&>[data-slot=icon-svg]]:text-v2-icon-icon-muted"
+          onClick={() => void updater.run()}
+        >
+          <IconV2 name="reset" size="small" />
+          <span class={HOME_PROJECT_NAV_LABEL}>{props.language.t(label())}</span>
+        </HomeProjectNavButton>
+      </Show>
       <HomeProjectNavButton
         type="button"
         class="text-v2-text-text-faint [&>[data-slot=icon-svg]]:text-v2-icon-icon-muted"
