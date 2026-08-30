@@ -1,7 +1,6 @@
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { DialogBody, DialogFooter, DialogHeader, DialogTitleGroup, DialogV2 } from "@opencode-ai/ui/v2/dialog-v2"
-import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { createEffect, createSignal, onCleanup, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { errorMessage } from "@/pages/layout/helpers"
@@ -44,16 +43,14 @@ export function createDeleteProjectDialogController(input: {
   onFailure: (error: unknown) => void
 }) {
   const [state, setState] = createSignal<DeleteDialogState>("confirming")
-  const [acknowledgement, setAcknowledgementValue] = createSignal("")
   const [failure, setFailure] = createSignal<string>()
 
-  const canDelete = () => state() === "retryable_error" || (state() === "confirming" && acknowledgement() === "DELETE")
+  const canDelete = () => state() === "retryable_error" || state() === "confirming"
   const canDismiss = () => state() !== "deleting"
 
   const submit = async () => {
     const current = state()
     if (current === "deleting") return
-    if (current === "confirming" && acknowledgement() !== "DELETE") return
     setState("deleting")
     try {
       await (current === "retryable_error" ? input.retry() : input.remove())
@@ -75,12 +72,7 @@ export function createDeleteProjectDialogController(input: {
 
   return {
     state,
-    acknowledgement,
     failure,
-    setAcknowledgement(value: string) {
-      if (state() === "deleting") return
-      setAcknowledgementValue(value)
-    },
     canDelete,
     canDismiss,
     submit,
@@ -130,19 +122,7 @@ export function DialogDeleteProject(props: {
             description={language.t("project.delete.confirm", { name: props.name })}
           />
         </DialogHeader>
-        <DialogBody class="flex flex-col gap-3">
-          <Show when={controller.state() !== "retryable_error"}>
-            <label class="flex flex-col gap-1 text-12-regular text-text-strong">
-              <span>{language.t("project.delete.acknowledge")}</span>
-              <TextInputV2
-                autofocus
-                aria-label={language.t("project.delete.acknowledge")}
-                value={controller.acknowledgement()}
-                disabled={controller.state() === "deleting"}
-                onInput={(event) => controller.setAcknowledgement(event.currentTarget.value)}
-              />
-            </label>
-          </Show>
+        <DialogBody class="flex flex-col gap-3 px-4 pt-4 pb-2">
           <Show when={controller.state() === "deleting"}>
             <div role="status" aria-live="polite">
               {language.t("project.delete.progress")}

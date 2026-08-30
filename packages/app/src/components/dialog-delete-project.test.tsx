@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { createDeleteProjectDialogController as createController } from "./dialog-delete-project"
 
 describe("delete project dialog", () => {
-  test("requires the exact DELETE acknowledgement", () => {
+  test("enables the delete button immediately in the confirming state", () => {
     const controller = createController({
       remove: async () => {},
       retry: async () => {},
@@ -13,12 +13,6 @@ describe("delete project dialog", () => {
     })
 
     expect(controller.state()).toBe("confirming")
-    expect(controller.canDelete()).toBe(false)
-    controller.setAcknowledgement("delete")
-    expect(controller.canDelete()).toBe(false)
-    controller.setAcknowledgement("DELETE ")
-    expect(controller.canDelete()).toBe(false)
-    controller.setAcknowledgement("DELETE")
     expect(controller.canDelete()).toBe(true)
   })
 
@@ -37,7 +31,6 @@ describe("delete project dialog", () => {
       focusRetry: () => {},
       onFailure: () => {},
     })
-    controller.setAcknowledgement("DELETE")
 
     const first = controller.submit()
     const duplicate = controller.submit()
@@ -74,7 +67,6 @@ describe("delete project dialog", () => {
       focusRetry: () => focused++,
       onFailure: () => {},
     })
-    controller.setAcknowledgement("DELETE")
 
     await controller.submit()
     expect(controller.state()).toBe("retryable_error")
@@ -111,7 +103,6 @@ describe("delete project dialog", () => {
       focusRetry: () => focused++,
       onFailure: () => {},
     })
-    controller.setAcknowledgement("DELETE")
 
     await controller.submit()
     expect(controller.state()).toBe("retryable_error")
@@ -180,7 +171,6 @@ describe("delete project dialog", () => {
         focusRetry: () => focused++,
         onFailure: () => failed++,
       })
-      controller.setAcknowledgement("DELETE")
 
       await controller.submit()
       expect(controller.state()).toBe("confirming")
@@ -208,7 +198,6 @@ describe("delete project dialog", () => {
       focusRetry: () => focused++,
       onFailure: () => failed++,
     })
-    controller.setAcknowledgement("DELETE")
 
     await controller.submit()
     expect(controller.state()).toBe("confirming")
