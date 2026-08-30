@@ -46,6 +46,7 @@ export type ElectronAPI = {
   killSidecar: () => Promise<void>
   installCli: () => Promise<string>
   awaitInitialization: () => Promise<ServerReadyData>
+  onSidecarChanged: (cb: (data: ServerReadyData) => void) => () => void
   wslServers: WslServersAPI
   updater: UpdaterAPI
   consumeInitialDeepLinks: () => Promise<string[]>

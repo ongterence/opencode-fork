@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron"
-import type { ElectronAPI, WslServersEvent } from "./types"
+import type { ElectronAPI, ServerReadyData, WslServersEvent } from "./types"
 import type { UpdaterState } from "@opencode-ai/app/updater"
 
 const updaterCallbacks = new Set<(state: UpdaterState) => void>()
@@ -14,6 +14,11 @@ const api: ElectronAPI = {
   killSidecar: () => ipcRenderer.invoke("kill-sidecar"),
   installCli: () => ipcRenderer.invoke("install-cli"),
   awaitInitialization: () => ipcRenderer.invoke("await-initialization"),
+  onSidecarChanged: (cb) => {
+    const handler = (_: unknown, data: ServerReadyData) => cb(data)
+    ipcRenderer.on("sidecar-changed", handler)
+    return () => ipcRenderer.removeListener("sidecar-changed", handler)
+  },
   wslServers: {
     getState: () => ipcRenderer.invoke("wsl-servers-get-state"),
     subscribe: (cb) => {

@@ -21,6 +21,7 @@ import type { AsyncStorage } from "@solid-primitives/storage"
 import { createMemoryHistory, MemoryRouter, type BaseRouterProps } from "@solidjs/router"
 import { createEffect, createMemo, createResource, createSignal, onCleanup, Show } from "solid-js"
 import { render } from "solid-js/web"
+import type { ServerReadyData } from "../preload/types"
 import pkg from "../../package.json"
 import { t } from "./i18n"
 import { initializationData } from "./initialization"
@@ -62,6 +63,11 @@ if (import.meta.env.VITE_SENTRY_DSN) {
 
 const [updaterState, setUpdaterState] = createSignal<UpdaterState>({ status: "disabled" })
 void window.api.updater.subscribe(setUpdaterState)
+
+// When the main process respawns the sidecar it may come back on a new port;
+// this override takes precedence over the one-shot awaitInitialization result.
+const [sidecarOverride, setSidecarOverride] = createSignal<ServerReadyData>()
+window.api.onSidecarChanged(setSidecarOverride)
 
 const deepLinkEvent = "opencode:deep-link"
 
@@ -380,7 +386,7 @@ function DesktopRoot(props: { windowState: DesktopWindowState }) {
       () => !defaultServer.loading && !sidecar.loading && !locale.loading && !wslServers.isLoading,
     )
     const servers = createMemo(() => {
-      const data = initializationData(sidecar)
+      const data = sidecarOverride() ?? initializationData(sidecar)
       const list: ServerConnection.Any[] = []
       if (data) {
         list.push({

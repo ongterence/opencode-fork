@@ -309,3 +309,10 @@ export function sendMenuCommand(win: BrowserWindow, id: string) {
 export function sendDeepLinks(win: BrowserWindow, urls: string[]) {
   win.webContents.send("deep-link", urls)
 }
+
+export function sendSidecarChanged(data: ServerReadyData) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue
+    win.webContents.send("sidecar-changed", data)
+  }
+}

@@ -42,20 +42,27 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
 
     const serverCtxs = new Map<
       ServerConnection.Key,
-      { dispose: () => void; serverCtx: ReturnType<typeof createServerCtx> }
+      { url: string; dispose: () => void; serverCtx: ReturnType<typeof createServerCtx> }
     >()
 
     const owner = getOwner()
 
     const ensureServerCtx = (conn: ServerConnection.Any) => {
       const key = ServerConnection.key(conn)
+      const url = conn.http.url
       const existing = serverCtxs.get(key)
-      if (existing) return existing.serverCtx
+      if (existing) {
+        // A respawned sidecar can come back on a new URL under the same key;
+        // SDK contexts are bound to the URL at creation, so rebuild on change.
+        if (existing.url === url) return existing.serverCtx
+        existing.dispose()
+        serverCtxs.delete(key)
+      }
       const root = createRoot((dispose) => {
         const serverCtx = createServerCtx(conn, server.scope(key), server.projects.forServer(key))
         return { dispose, serverCtx }
       }, owner as any)
-      serverCtxs.set(key, root)
+      serverCtxs.set(key, { url, dispose: root.dispose, serverCtx: root.serverCtx })
       return root.serverCtx
     }
 

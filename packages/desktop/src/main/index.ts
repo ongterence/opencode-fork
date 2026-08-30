@@ -14,7 +14,7 @@ import contextMenu from "electron-context-menu"
 import type { ServerReadyData } from "../preload/types"
 import { checkAppExists, resolveAppPath } from "./apps"
 import { APP_IDS, CHANNEL } from "./constants"
-import { registerIpcHandlers, sendDeepLinks, sendMenuCommand } from "./ipc"
+import { registerIpcHandlers, sendDeepLinks, sendMenuCommand, sendSidecarChanged } from "./ipc"
 import { forwardInitializationFailure } from "./initialization"
 import { exportDebugLogs, initCrashReporter, initLogging, startNetLog, write as writeLog } from "./logging"
 import { createMenu } from "./menu"
@@ -62,6 +62,9 @@ const jsCallStackFeature = "DocumentPolicyIncludeJSCallStacksInCrashReports"
 
 let logger: ReturnType<typeof initLogging>
 let server: SidecarListener | null = null
+let currentServer: ServerReadyData | null = null
+let sidecarTarget = { hostname: "127.0.0.1", port: 0, password: "" }
+let sidecarRespawning = false
 
 const pendingDeepLinks: string[] = []
 
@@ -86,6 +89,82 @@ async function killSidecar() {
   const current = server
   server = null
   await current.stop()
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+function findFreePort() {
+  return new Promise<number>((resolve, reject) => {
+    const socket = createServer()
+    socket.on("error", reject)
+    socket.listen(0, "127.0.0.1", () => {
+      const address = socket.address()
+      if (typeof address !== "object" || !address) {
+        socket.close(() => reject(new Error("Failed to get port")))
+        return
+      }
+      const port = address.port
+      socket.close(() => resolve(port))
+    })
+  })
+}
+
+function sidecarSpawnOptions() {
+  return {
+    userDataPath: app.getPath("userData"),
+    onStdout: (message: string) => writeLog("server", "stdout", { message }),
+    onStderr: (message: string) => writeLog("server", "stderr", { message }, "warn"),
+    onExit: (code: number) => void sidecarExited(code),
+  }
+}
+
+// An unexpected sidecar exit must not leave the app server-less: the renderer
+// keeps issuing fetches against the last URL forever. Deliberate stops
+// (killSidecar) null `server` first, which suppresses the respawn.
+function sidecarExited(code: number) {
+  writeLog("utility", "sidecar exited", { code }, "warn")
+  if (!server || sidecarRespawning) return
+  sidecarRespawning = true
+  void (async () => {
+    try {
+      const target = { ...sidecarTarget }
+      for (let attempt = 0; server; attempt++) {
+        const base = Math.min(1000 * 2 ** attempt, 15000)
+        await delay(base / 2 + Math.random() * (base / 2))
+        if (!server) return
+        try {
+          const { listener } = await spawnLocalServer(
+            target.hostname,
+            target.port,
+            target.password,
+            sidecarSpawnOptions(),
+          )
+          server = listener
+          const next: ServerReadyData = {
+            url: `http://${target.hostname}:${target.port}`,
+            username: "opencode",
+            password: target.password,
+          }
+          const changed = currentServer?.url !== next.url
+          currentServer = next
+          logger.log("sidecar respawned", { url: next.url, attempt })
+          if (changed) sendSidecarChanged(next)
+          return
+        } catch (error) {
+          logger.error("sidecar respawn failed", error)
+          if (attempt % 2 === 1) {
+            // The old port may have been claimed while the sidecar was down;
+            // retry on a fresh one and let the renderer pick up the new URL.
+            target.port = await findFreePort().catch(() => target.port)
+          }
+        }
+      }
+    } finally {
+      sidecarRespawning = false
+    }
+  })()
 }
 
 function ensureLoopbackNoProxy() {
@@ -286,8 +365,9 @@ const main = Effect.gen(function* () {
       function* () {
         logger.log("awaiting server ready")
         const res = yield* Deferred.await(serverReady)
-        logger.log("server ready", { url: res.url })
-        return res
+        const latest = currentServer ?? res
+        logger.log("server ready", { url: latest.url })
+        return latest
       },
       (e) => Effect.runPromise(e),
     ),
@@ -332,11 +412,13 @@ const main = Effect.gen(function* () {
     if (SIDECAR_VERSION === "v2") {
       logger.log("spawning v2 sidecar")
       const sidecar = yield* Effect.promise(() => startBackgroundCli(logger, shellEnv?.XDG_STATE_HOME))
-      yield* Deferred.succeed(serverReady, {
+      const ready: ServerReadyData = {
         url: sidecar.url,
         username: sidecar.username,
         password: sidecar.password,
-      })
+      }
+      currentServer = ready
+      yield* Deferred.succeed(serverReady, ready)
 
       if (process.platform === "win32") {
         void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
@@ -353,41 +435,21 @@ const main = Effect.gen(function* () {
         if (!Number.isNaN(parsed)) return parsed
       }
 
-      const res = yield* Deferred.make<number, unknown>()
-      const socket = createServer()
-      socket.on("error", (e) => Deferred.failSync(res, () => e))
-      socket.listen(0, "127.0.0.1", () => {
-        const address = socket.address()
-        if (typeof address !== "object" || !address) {
-          socket.close()
-          Deferred.failSync(res, () => new Error("Failed to get port"))
-          return
-        }
-        const port = address.port
-        socket.close(() => Effect.runSync(Deferred.succeed(res, port)))
-      })
-
-      return yield* Deferred.await(res)
+      return yield* Effect.promise(() => findFreePort())
     })
     const hostname = "127.0.0.1"
     const url = `http://${hostname}:${port}`
     const password = randomUUID()
+    sidecarTarget = { hostname, port, password }
 
     logger.log("spawning sidecar", { url })
     const { listener, health } = yield* Effect.promise(() =>
-      spawnLocalServer(hostname, port, password, {
-        userDataPath: app.getPath("userData"),
-        onStdout: (message) => writeLog("server", "stdout", { message }),
-        onStderr: (message) => writeLog("server", "stderr", { message }, "warn"),
-        onExit: (code) => writeLog("utility", "sidecar exited", { code }, "warn"),
-      }),
+      spawnLocalServer(hostname, port, password, sidecarSpawnOptions()),
     )
     server = listener
-    yield* Deferred.succeed(serverReady, {
-      url,
-      username: "opencode",
-      password,
-    })
+    const ready: ServerReadyData = { url, username: "opencode", password }
+    currentServer = ready
+    yield* Deferred.succeed(serverReady, ready)
 
     if (process.platform === "win32") {
       void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
