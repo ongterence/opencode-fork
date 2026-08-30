@@ -16,6 +16,9 @@ export function runDesktopMenuAction(
     case "app.checkForUpdates":
       handlers.checkForUpdates?.()
       return
+    case "app.updateOpencode":
+      handlers.checkForUpdates?.()
+      return
     case "app.relaunch":
       handlers.relaunch?.()
       return

@@ -9,6 +9,8 @@ const desktop = [
   "Langas",
   "Žinynas",
   "Tikrinti, ar yra naujinimų...",
+  "Update Opencode",
+
   "Nuostatos",
   "Įkelti Webview iš naujo",
   "Paleisti iš naujo",

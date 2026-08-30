@@ -1064,6 +1064,7 @@ export const dict = {
   "desktop.menu.window": "Ikkuna",
   "desktop.menu.help": "Ohje",
   "desktop.menu.checkForUpdates": "Tarkista päivitykset...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "Asetukset",
   "desktop.menu.reloadWebview": "Lataa verkkonäkymä uudelleen",
   "desktop.menu.restart": "Käynnistä uudelleen",

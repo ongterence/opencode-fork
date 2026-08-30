@@ -7,6 +7,7 @@ export const dict: Record<string, string> = {
   "desktop.menu.window": "කවුළුව",
   "desktop.menu.help": "උදව්",
   "desktop.menu.checkForUpdates": "යාවත්කාලීන සඳහා පරීක්ෂා කරන්න...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "සැකසීම්",
   "desktop.menu.reloadWebview": "Webview නැවත පූරණය කරන්න",
   "desktop.menu.restart": "යළි අරඹන්න",

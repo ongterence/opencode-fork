@@ -7,6 +7,7 @@ export const dict = {
   "desktop.menu.window": "ປ່ອງຢ້ຽມ",
   "desktop.menu.help": "ຊ່ວຍ",
   "desktop.menu.checkForUpdates": "ກວດເບິ່ງການອັບເດດ...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "ການຕັ້ງຄ່າ",
   "desktop.menu.reloadWebview": "ໂຫຼດ Webview ຄືນໃໝ່",
   "desktop.menu.restart": "ຣີສະຕາດ",

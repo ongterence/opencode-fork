@@ -7,6 +7,7 @@ export const dict: Record<string, string> = {
   "desktop.menu.window": "སྒོང༌སྒྲིག",
   "desktop.menu.help": "ཆ་རོགས་འབད་ནི",
   "desktop.menu.checkForUpdates": "དུས་མཐུན་ཚུ་གི་དོན་ལུ་ཞིབ་དཔྱད་འབད།",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "སྒྲིག་སྟངས་ཚུ།",
   "desktop.menu.reloadWebview": "ཡང་བསྐྱར་མངོན་གསལ་ Webview།",
   "desktop.menu.restart": "ལོག་འགོ་བཙུགས།",

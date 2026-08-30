@@ -7,6 +7,7 @@ export const dict = {
   "desktop.menu.window": "ဝင်းဒိုး",
   "desktop.menu.help": "အကူအညီ",
   "desktop.menu.checkForUpdates": "အပ်ဒိတ်များအတွက် စစ်ဆေးပါ...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "ဆက်တင်များ",
   "desktop.menu.reloadWebview": "Webview ကို ပြန်လည်စတင်ပါ။",
   "desktop.menu.restart": "ပြန်လည်စတင်ပါ။",

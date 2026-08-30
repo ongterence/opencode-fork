@@ -9,6 +9,8 @@ const desktop = [
   "Prozor",
   "Pomoć",
   "Provjeri ima li ažuriranja...",
+  "Update Opencode",
+
   "Postavke",
   "Ponovno učitaj Webview",
   "Ponovno pokreni",

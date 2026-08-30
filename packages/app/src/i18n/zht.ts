@@ -11,6 +11,7 @@ export const dict = {
   "desktop.menu.window": "視窗",
   "desktop.menu.help": "說明",
   "desktop.menu.checkForUpdates": "檢查更新...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "設定",
   "desktop.menu.reloadWebview": "重新載入 Webview",
   "desktop.menu.restart": "重新啟動",

@@ -7,6 +7,7 @@ export const dict = {
   "desktop.menu.window": "መስኮት",
   "desktop.menu.help": "እገዛ",
   "desktop.menu.checkForUpdates": "ዝማኔዎችን ይመልከቱ...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "ቅንጅቶች",
   "desktop.menu.reloadWebview": "ዳግም ጫን Webview",
   "desktop.menu.restart": "ዳግም አስጀምር",

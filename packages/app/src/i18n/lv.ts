@@ -7,6 +7,7 @@ export const dict = {
   "desktop.menu.window": "Logs",
   "desktop.menu.help": "Palīdzība",
   "desktop.menu.checkForUpdates": "Pārbaudīt atjauninājumus...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "Iestatījumi",
   "desktop.menu.reloadWebview": "Pārlādēt tīmekļa skatu",
   "desktop.menu.restart": "Restartēt",

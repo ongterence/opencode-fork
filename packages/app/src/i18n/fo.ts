@@ -7,6 +7,7 @@ export const dict = {
   "desktop.menu.window": "Vindeyga",
   "desktop.menu.help": "Hjálp",
   "desktop.menu.checkForUpdates": "Kanna fyri dagføringum...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "Innstillingar",
   "desktop.menu.reloadWebview": "Endurlesa vevvísing",
   "desktop.menu.restart": "Endurbyrja",

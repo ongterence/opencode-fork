@@ -9,6 +9,8 @@ const desktop = [
   "Gluggi",
   "Hjálp",
   "Leita að uppfærslum...",
+  "Update Opencode",
+
   "Stillingar",
   "Endurhlaða Webview",
   "Endurræsa",

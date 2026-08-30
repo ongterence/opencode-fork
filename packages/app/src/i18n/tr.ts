@@ -11,6 +11,7 @@ export const dict = {
   "desktop.menu.window": "Pencere",
   "desktop.menu.help": "Yardım",
   "desktop.menu.checkForUpdates": "Güncellemeleri kontrol et...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "Ayarlar",
   "desktop.menu.reloadWebview": "Web görünümünü yeniden yükle",
   "desktop.menu.restart": "Yeniden başlat",

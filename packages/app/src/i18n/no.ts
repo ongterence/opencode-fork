@@ -10,6 +10,7 @@ export const dict = {
   "desktop.menu.window": "Vindu",
   "desktop.menu.help": "Hjelp",
   "desktop.menu.checkForUpdates": "Søk etter oppdateringer...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "Innstillinger",
   "desktop.menu.reloadWebview": "Last inn WebView på nytt",
   "desktop.menu.restart": "Start på nytt",

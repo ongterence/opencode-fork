@@ -230,6 +230,7 @@ export const DESKTOP_NATIVE_ENGLISH = {
   "desktop.menu.window": "Window",
   "desktop.menu.help": "Help",
   "desktop.menu.checkForUpdates": "Check for Updates...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "Settings",
   "desktop.menu.reloadWebview": "Reload Webview",
   "desktop.menu.restart": "Restart",

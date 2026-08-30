@@ -9,6 +9,8 @@ const desktop = [
   "Ablak",
   "Súgó",
   "Frissítések keresése...",
+  "Update Opencode",
+
   "Beállítások",
   "Webview újratöltése",
   "Újraindítás",

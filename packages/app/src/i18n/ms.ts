@@ -7,6 +7,7 @@ export const dict = {
   "desktop.menu.window": "Tetingkap",
   "desktop.menu.help": "Bantuan",
   "desktop.menu.checkForUpdates": "Semak Kemas Kini...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "Tetapan",
   "desktop.menu.reloadWebview": "Muat Semula Paparan Web",
   "desktop.menu.restart": "Mulakan Semula",

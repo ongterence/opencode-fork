@@ -4,6 +4,7 @@ export type DesktopMenuPlatform = "macos" | "windows"
 
 export type DesktopMenuAction =
   | "app.checkForUpdates"
+  | "app.updateOpencode"
   | "app.relaunch"
   | "edit.undo"
   | "edit.redo"
@@ -118,6 +119,12 @@ export const DESKTOP_MENU: DesktopMenu[] = [
         command: "settings.open",
         accelerator: { windows: "Ctrl+," },
         platforms: ["windows"],
+      },
+      {
+        type: "item",
+        labelKey: "desktop.menu.updateOpencode",
+        action: "app.updateOpencode",
+        enabled: "updater",
       },
       {
         type: "item",

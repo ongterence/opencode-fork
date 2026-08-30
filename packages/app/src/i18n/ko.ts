@@ -1075,6 +1075,7 @@ export const dict = {
   "desktop.menu.window": "윈도우",
   "desktop.menu.help": "도움말",
   "desktop.menu.checkForUpdates": "업데이트 확인...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "설정",
   "desktop.menu.reloadWebview": "WebView 새로 고침",
   "desktop.menu.restart": "다시 시작",

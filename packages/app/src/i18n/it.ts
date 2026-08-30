@@ -1088,6 +1088,7 @@ export const dict = {
   "desktop.menu.window": "Finestra",
   "desktop.menu.help": "Aiuto",
   "desktop.menu.checkForUpdates": "Verifica aggiornamenti...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "Impostazioni",
   "desktop.menu.reloadWebview": "Ricarica Webview",
   "desktop.menu.restart": "Riavvia",

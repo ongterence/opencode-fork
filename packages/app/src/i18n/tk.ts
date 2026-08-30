@@ -7,6 +7,7 @@ export const dict = {
   "desktop.menu.window": "Penjire",
   "desktop.menu.help": "Kömek",
   "desktop.menu.checkForUpdates": "Täzelenmeleri barlaň ...",
+  "desktop.menu.updateOpencode": "Update Opencode",
   "desktop.menu.settings": "Sazlamalar",
   "desktop.menu.reloadWebview": "Web sahypasyny täzeden ýükläň",
   "desktop.menu.restart": "Gaýtadan açyň",
