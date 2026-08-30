@@ -107,11 +107,21 @@ export function projectForSession<T extends { id?: string; worktree: string; san
   )
 }
 
+// Browser fetch rejects with an engine-specific TypeError before any response
+// exists; the raw message ("Failed to fetch") is meaningless to users, so the
+// caller's localized fallback is used instead.
+const NETWORK_ERROR_MESSAGES = new Set([
+  "Failed to fetch",
+  "NetworkError when attempting to fetch resource.",
+  "Load failed",
+])
+
 export const errorMessage = (err: unknown, fallback: string) => {
   if (err && typeof err === "object" && "data" in err) {
     const data = (err as { data?: { message?: string } }).data
     if (data?.message) return data.message
   }
+  if (err instanceof TypeError && NETWORK_ERROR_MESSAGES.has(err.message)) return fallback
   if (err instanceof Error) return err.message
   return fallback
 }

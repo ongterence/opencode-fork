@@ -147,6 +147,7 @@ export function createHomeProjectsController(home: HomeController) {
         if (next) home.selection.set(next)
       },
       delete: (conn: ServerConnection.Any, project: LocalProject) => {
+        if (home.server.health(conn)?.healthy === false) return
         const ctx = home.server.context(conn)
         const projectID = project.id
         if (projectID === "global") return

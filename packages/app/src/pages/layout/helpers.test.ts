@@ -344,4 +344,13 @@ describe("layout workspace helpers", () => {
     expect(errorMessage(new Error("broken"), "fallback")).toBe("broken")
     expect(errorMessage("unknown", "fallback")).toBe("fallback")
   })
+
+  test("uses the fallback for network-level fetch failures", () => {
+    expect(errorMessage(new TypeError("Failed to fetch"), "fallback")).toBe("fallback")
+    expect(errorMessage(new TypeError("NetworkError when attempting to fetch resource."), "fallback")).toBe("fallback")
+    expect(errorMessage(new TypeError("Load failed"), "fallback")).toBe("fallback")
+    expect(errorMessage(new TypeError("Cannot read properties of undefined"), "fallback")).toBe(
+      "Cannot read properties of undefined",
+    )
+  })
 })
